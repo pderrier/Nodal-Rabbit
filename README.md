@@ -113,6 +113,9 @@ A first MVP bootstrap is now available in this repository:
 - Pattern detection command: `agentos patterns list` to identify repeated decisions and compute conservative rule metrics.
 - Walk-forward backtest command: `agentos backtest run` for deterministic candidates before promotion.
 - Rule promotion command: `agentos rules promote` with fallback preserved and evidence persisted locally.
+- Rule rejection command: `agentos rules reject` for explicit non-promotion decisions with recorded evidence.
+- MVP spec aliases are also available via `agentos compile candidates|backtest|promote|reject`.
+- Optional config file support: `agentos.yaml` with `wrap.intent`, `wrap.source`, `wrap.capture_stdout`, `wrap.capture_stderr`, and `wrap.rule_first`.
 
 Quick local run:
 
@@ -133,13 +136,33 @@ python -m agentos decision record --run-id <run_id> --key route.fix_ci --data-js
 
 # detect repeated patterns with support and abstention-aware metrics
 python -m agentos patterns list --min-support 2 --limit 20
+# equivalent alias aligned with MVP spec wording
+python -m agentos compile candidates --min-support 2 --limit 20
 
 # backtest one deterministic candidate with abstention constraints
 python -m agentos backtest run --decision-key route.fix_ci --min-history 3 --min-confidence 0.8
+# equivalent alias aligned with MVP spec wording
+python -m agentos compile backtest --decision-key route.fix_ci --min-history 3 --min-confidence 0.8
 
 # promote only if backtest metrics satisfy your threshold; fallback stays enabled
 python -m agentos rules promote --decision-key route.fix_ci --min-history 3 --min-confidence 0.8 --min-accuracy 1.0
+# equivalent alias aligned with MVP spec wording
+python -m agentos compile promote --decision-key route.fix_ci --min-history 3 --min-confidence 0.8 --min-accuracy 1.0
+
+# explicit rejection (records rationale + metrics snapshot)
+python -m agentos rules reject --decision-key route.fix_ci --reason "manual_review_required"
+python -m agentos compile reject --decision-key route.fix_ci --reason "manual_review_required"
 python -m agentos rules list --limit 20
+```
+
+Rule-first runtime (conservative by default):
+
+```bash
+# check promoted rule first, but still run fallback process by default ("observe")
+python -m agentos wrap --intent demo.rule_first --rule-first --decision-key route.fix_ci -- echo "still runs fallback"
+
+# explicit opt-in to skip fallback if a promoted rule matches
+python -m agentos wrap --intent demo.rule_first --rule-first --decision-key route.fix_ci --on-rule-match skip-fallback -- echo "fallback skipped on match"
 ```
 
 Expected output shape:

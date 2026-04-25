@@ -16,7 +16,7 @@ Ce document est la roadmap d’exécution de la spec canonique `agentos_mvp_v0_3
 ### État global
 - **Semaine active:** Semaine 1 (Wrap + traces).
 - **Progression estimée MVP:** ~25% (wrapper + persistance + instrumentation initiale).
-- **Bloquant actuel:** aucun bloquant technique majeur; prochaines étapes = candidates/backtest + config `agentos.yaml`.
+- **Bloquant actuel:** aucun bloquant technique majeur; prochaines étapes = stabilisation e2e + release checklist.
 
 ### Journal d'avancement
 - ✅ Initialisation d'une CLI Python `agentos` (commande `wrap`).
@@ -25,7 +25,10 @@ Ce document est la roadmap d’exécution de la spec canonique `agentos_mvp_v0_3
 - ✅ Redaction minimale des variables d'environnement sensibles (`TOKEN/SECRET/PASSWORD/KEY`) dans les événements.
 - ✅ Commandes d'instrumentation `decision record|list|show` et `outcome record` implémentées.
 - ✅ Suite de tests automatisés ajoutée (CLI + stockage) pour maintenir un coverage élevé sur les modules MVP.
-- ⏳ À faire immédiatement: détection de candidats (`compile candidates`) et backtest (`compile backtest`) avec métriques.
+- ✅ Alias CLI spec ajoutés: `compile candidates|backtest|promote` (branchés sur les commandes MVP existantes).
+- ✅ Config `agentos.yaml` (defaults wrap) branchée sur la CLI.
+- ✅ `compile reject` / `rules reject` implémentés avec persistance d’un snapshot métriques + raison.
+- ✅ Runtime `wrap --rule-first` conservateur implémenté (`observe` par défaut, `skip-fallback` en opt-in explicite).
 
 ## 1) Backlog priorisé (non redondant avec la spec)
 
