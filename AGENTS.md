@@ -19,6 +19,7 @@ Required implementation behavior:
 - Every compiled rule must abstain when uncertain.
 - Every promoted rule must include backtest metrics.
 - Prefer simple local primitives (CLI, SQLite, JSONL, filesystem artifacts).
+- Every implementation change must include automated tests and maintain high coverage (target: >=85% on touched modules).
 
 Prohibited drift:
 - Do not build a coding agent.

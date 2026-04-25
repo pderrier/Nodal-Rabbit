@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentos"
+version = "0.1.0"
+description = "AgentOS MVP v0 bootstrap: wrapper-first execution and trace layer"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "AgentOS contributors"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+agentos = "agentos.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
