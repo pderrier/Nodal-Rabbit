@@ -1015,6 +1015,9 @@ class CLITestCase(unittest.TestCase):
             by_id = {row["gate_id"]: row for row in gates}
             self.assertEqual(by_id["vertical_slice_doc"]["status"], "fail")
             self.assertEqual(by_id["release_checklist_doc"]["status"], "fail")
+            self.assertEqual(by_id["mvp_spec_doc"]["status"], "fail")
+            self.assertEqual(by_id["roadmap_doc"]["status"], "fail")
+            self.assertEqual(by_id["readme_release_references"]["status"], "fail")
             self.assertEqual(by_id["data_model_minimum_records"]["status"], "warn")
 
             code, out, _ = self._run_cli(["release", "checklist", "--strict", "--json"])
