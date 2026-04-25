@@ -86,6 +86,9 @@ def ensure_schema(home: Path) -> sqlite3.Connection:
             run_id TEXT NOT NULL,
             ts TEXT NOT NULL,
             decision_key TEXT,
+            decision_source TEXT NOT NULL DEFAULT 'cli_record',
+            decision_validity TEXT NOT NULL DEFAULT 'valid',
+            compilation_candidate INTEGER NOT NULL DEFAULT 0,
             payload_json TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         )
@@ -200,10 +203,25 @@ def record_decision(
     run_id: str,
     decision_key: str | None,
     payload: dict[str, Any],
+    decision_source: str = "cli_record",
+    decision_validity: str = "valid",
+    compilation_candidate: bool = False,
 ) -> int:
     cursor = conn.execute(
-        "INSERT INTO decisions(run_id, ts, decision_key, payload_json) VALUES (?, ?, ?, ?)",
-        (run_id, utc_now_iso(), decision_key, json.dumps(payload, ensure_ascii=False)),
+        """
+        INSERT INTO decisions(
+            run_id, ts, decision_key, decision_source, decision_validity, compilation_candidate, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            utc_now_iso(),
+            decision_key,
+            decision_source,
+            decision_validity,
+            int(compilation_candidate),
+            json.dumps(payload, ensure_ascii=False),
+        ),
     )
     conn.commit()
     return int(cursor.lastrowid)
@@ -213,7 +231,7 @@ def list_decisions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Ro
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
         """
-        SELECT id, run_id, ts, decision_key, payload_json
+        SELECT id, run_id, ts, decision_key, decision_source, decision_validity, compilation_candidate, payload_json
         FROM decisions
         ORDER BY id DESC
         LIMIT ?
@@ -236,7 +254,17 @@ def list_decision_patterns(
                 decision_key,
                 json_extract(payload_json, '$.chosen') AS chosen
             FROM decisions
-            WHERE decision_key IS NOT NULL
+            WHERE
+                decision_key IS NOT NULL
+                AND decision_source IN ('decision_file', 'stdout_marker', 'cli_record', 'sdk_record')
+                AND decision_validity = 'valid'
+                AND compilation_candidate = 1
+                AND EXISTS (
+                    SELECT 1
+                    FROM outcomes o
+                    WHERE o.run_id = decisions.run_id
+                      AND o.status IN ('success', 'accepted')
+                )
         ),
         choice_counts AS (
             SELECT
@@ -289,7 +317,17 @@ def list_decision_choices(conn: sqlite3.Connection, decision_key: str) -> list[s
         """
         SELECT json_extract(payload_json, '$.chosen') AS chosen
         FROM decisions
-        WHERE decision_key = ?
+        WHERE
+            decision_key = ?
+            AND decision_source IN ('decision_file', 'stdout_marker', 'cli_record', 'sdk_record')
+            AND decision_validity = 'valid'
+            AND compilation_candidate = 1
+            AND EXISTS (
+                SELECT 1
+                FROM outcomes o
+                WHERE o.run_id = decisions.run_id
+                  AND o.status IN ('success', 'accepted')
+            )
         ORDER BY id ASC
         """,
         (decision_key,),
@@ -301,7 +339,7 @@ def get_decision(conn: sqlite3.Connection, decision_id: int) -> sqlite3.Row | No
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
         """
-        SELECT id, run_id, ts, decision_key, payload_json
+        SELECT id, run_id, ts, decision_key, decision_source, decision_validity, compilation_candidate, payload_json
         FROM decisions
         WHERE id = ?
         """,

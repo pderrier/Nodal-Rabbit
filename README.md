@@ -15,6 +15,14 @@ In MVP, AgentOS focuses on:
 - Promoting conservative rules with metrics.
 - Running rule-first with fallback preserved by default.
 
+Core operating rule:
+
+```text
+Run capture is automatic.
+Decision capture is declarative.
+Compilation requires validated decisions and outcomes.
+```
+
 Core loop:
 
 ```text
@@ -52,6 +60,28 @@ AgentOS sits around existing workers:
 - AgentOS analyzes repetition and proposes deterministic candidates.
 - AgentOS backtests candidates before promotion.
 - Runtime can apply rule-first routing, then fallback to original process.
+
+## Decision capture model (MVP)
+
+AgentOS starts by wrapping existing automation:
+
+```bash
+agentos wrap --intent gitlab.fix_ci -- ./run-existing-agent.sh
+```
+
+This captures the run.
+
+To capture LLM decisions for compilation, the process must declare operational decisions through a decision file, stdout markers, or explicit instrumentation.
+
+```bash
+agentos wrap \
+  --intent gitlab.fix_ci \
+  --decision-file agentos-artifacts/decisions.json \
+  -- ./run-existing-agent.sh
+```
+
+AgentOS does not infer hidden model reasoning.
+It compiles only validated declared decisions with outcomes.
 
 ## Repository contents
 

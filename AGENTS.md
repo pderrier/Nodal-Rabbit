@@ -28,3 +28,17 @@ Prohibited drift:
 - Do not claim sandboxing in MVP.
 - Do not hide safety constraints only in prompts.
 - Do not add heavy dependencies without strong justification.
+
+## Decision capture rule
+
+AgentOS must never claim to capture hidden LLM reasoning or hidden LLM decisions.
+
+`agentos wrap` captures process execution.
+LLM decisions become AgentOS decisions only if explicitly declared through:
+- decision files,
+- stdout markers,
+- CLI/SDK instrumentation.
+
+Only valid declared decisions with associated outcomes may become compilation candidates.
+
+Passive stdout parsing may be used for debugging, but not for trusted compilation in MVP.
