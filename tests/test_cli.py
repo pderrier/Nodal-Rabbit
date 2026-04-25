@@ -151,6 +151,13 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(args.min_confidence, 0.8)
         self.assertEqual(args.min_accuracy, 0.9)
 
+    def test_parse_args_release_checklist(self) -> None:
+        args = parse_args(["release", "checklist", "--strict", "--json"])
+        self.assertEqual(args.command, "release")
+        self.assertEqual(args.release_command, "checklist")
+        self.assertTrue(args.strict)
+        self.assertTrue(args.json)
+
     def test_load_json_payload_validation(self) -> None:
         payload = _load_json_payload('{"a":1}')
         self.assertEqual(payload["a"], 1)
@@ -809,6 +816,110 @@ class CLITestCase(unittest.TestCase):
         self.assertTrue(payload["fallback_skipped"])
         self.assertEqual(payload["rule_id"], "rule_skip_fallback")
 
+
+    def test_release_vertical_slice_end_to_end_with_safe_default_fallback(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.release.vertical", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        for _ in range(5):
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "route.release",
+                    "--candidate",
+                    "true",
+                    "--data-json",
+                    '{"chosen":"retry"}',
+                ]
+            )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
+
+        code, out, _ = self._run_cli(["compile", "candidates", "--min-support", "2", "--limit", "10"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        by_key = {row["decision_key"]: row for row in rows}
+        self.assertIn("route.release", by_key)
+        self.assertEqual(by_key["route.release"]["confidence"], 1.0)
+
+        code, out, _ = self._run_cli(
+            [
+                "compile",
+                "backtest",
+                "--decision-key",
+                "route.release",
+                "--min-history",
+                "3",
+                "--min-confidence",
+                "0.8",
+            ]
+        )
+        self.assertEqual(code, 0)
+        backtest_payload = json.loads(out)
+        self.assertTrue(backtest_payload["promote_ready"])
+
+        code, out, _ = self._run_cli(
+            [
+                "compile",
+                "promote",
+                "--decision-key",
+                "route.release",
+                "--min-history",
+                "3",
+                "--min-confidence",
+                "0.8",
+                "--min-accuracy",
+                "1.0",
+                "--rule-id",
+                "rule_release_vertical",
+            ]
+        )
+        self.assertEqual(code, 0)
+        promote_payload = json.loads(out)
+        self.assertTrue(promote_payload["promoted"])
+        self.assertTrue(promote_payload["fallback_enabled"])
+
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.release.vertical.observe",
+                "--rule-first",
+                "--decision-key",
+                "route.release",
+                "--",
+                "python",
+                "-c",
+                "import sys; sys.exit(0)",
+            ]
+        )
+        self.assertEqual(code, 0)
+        observe_payload = json.loads(out)
+        self.assertEqual(observe_payload["exit_code"], 0)
+        self.assertNotIn("fallback_skipped", observe_payload)
+
+        code, out, _ = self._run_cli(["runs", "trace", observe_payload["run_id"]])
+        self.assertEqual(code, 0)
+        self.assertIn('"type": "rule_match_checked"', out)
+        self.assertIn('"matched": true', out)
+
     def test_wrap_ingests_decision_file_and_outcome(self) -> None:
         artifact_dir = Path(self.temp_dir.name) / "agentos-artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -893,6 +1004,26 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(code, 2)
         payload = json.loads(out.strip().splitlines()[-1])
         self.assertEqual(payload["decision_error"], "invalid_declared_decision")
+
+    def test_release_checklist_reports_gates_and_strict_failure_when_artifacts_missing(self) -> None:
+        cwd = os.getcwd()
+        os.chdir(self.temp_dir.name)
+        try:
+            code, out, _ = self._run_cli(["release", "checklist", "--json"])
+            self.assertEqual(code, 0)
+            gates = [json.loads(line) for line in out.splitlines() if line.strip()]
+            by_id = {row["gate_id"]: row for row in gates}
+            self.assertEqual(by_id["vertical_slice_doc"]["status"], "fail")
+            self.assertEqual(by_id["release_checklist_doc"]["status"], "fail")
+            self.assertEqual(by_id["data_model_minimum_records"]["status"], "warn")
+
+            code, out, _ = self._run_cli(["release", "checklist", "--strict", "--json"])
+            self.assertEqual(code, 2)
+            gates = [json.loads(line) for line in out.splitlines() if line.strip()]
+            by_id = {row["gate_id"]: row for row in gates}
+            self.assertEqual(by_id["vertical_slice_doc"]["status"], "fail")
+        finally:
+            os.chdir(cwd)
 
 
 if __name__ == "__main__":

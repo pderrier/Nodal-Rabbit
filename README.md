@@ -88,6 +88,8 @@ It compiles only validated declared decisions with outcomes.
 - `agentos_mvp_v0_3.md` — canonical MVP product/technical specification.
 - `BACKLOG_MVP_PRIORISE_ROADMAP_6_SEMAINES.md` — six-week delivery roadmap and prioritized backlog.
 - `POSITIONING.md` — positioning document covering prior art, non-goals, and project rationale.
+- `VERTICAL_SLICE_MVP_RELEASE.md` — release-grade end-to-end MVP walkthrough.
+- `RELEASE_MVP_CHECKLIST.md` — MVP release checklist and anti-drift gates.
 
 ## Getting started
 
@@ -100,6 +102,15 @@ Suggested first steps:
 3. Align implementation work with MVP scope and anti-drift constraints.
 4. Read `POSITIONING.md` for positioning details and prior-art boundaries.
 
+
+
+## Release readiness artifacts
+
+For MVP release hardening and sign-off, use:
+
+1. `VERTICAL_SLICE_MVP_RELEASE.md` for end-to-end execution proof.
+2. `RELEASE_MVP_CHECKLIST.md` for anti-drift + quality gates.
+3. `python -m agentos release checklist --json` for executable gate evaluation.
 
 ## Implementation status (as of 2026-04-25)
 
@@ -116,6 +127,7 @@ A first MVP bootstrap is now available in this repository:
 - Rule rejection command: `agentos rules reject` for explicit non-promotion decisions with recorded evidence.
 - MVP spec aliases are also available via `agentos compile candidates|backtest|promote|reject`.
 - Optional config file support: `agentos.yaml` with `wrap.intent`, `wrap.source`, `wrap.capture_stdout`, `wrap.capture_stderr`, and `wrap.rule_first`.
+- Release gate command: `agentos release checklist` (supports `--strict` and `--json` for CI-friendly checks).
 
 Quick local run:
 

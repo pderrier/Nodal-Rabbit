@@ -196,6 +196,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rules_list = rules_sub.add_parser("list", help="List promoted rules")
     rules_list.add_argument("--limit", type=int, default=20)
 
+    release = sub.add_parser("release", help="Release readiness utilities")
+    release_sub = release.add_subparsers(dest="release_command", required=True)
+
+    release_checklist = release_sub.add_parser("checklist", help="Evaluate MVP release checklist gates")
+    release_checklist.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Return non-zero if any automatic gate fails",
+    )
+    release_checklist.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit one JSON object per checklist gate",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -1027,6 +1044,89 @@ def cmd_rules_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_checklist(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    now = utc_now_iso()
+    cwd = Path.cwd()
+
+    def _count(query: str, params: tuple[object, ...] = ()) -> int:
+        row = conn.execute(query, params).fetchone()
+        return int(row[0]) if row else 0
+
+    gates: list[dict[str, object]] = []
+
+    release_artifacts = (
+        ("vertical_slice_doc", "VERTICAL_SLICE_MVP_RELEASE.md"),
+        ("release_checklist_doc", "RELEASE_MVP_CHECKLIST.md"),
+    )
+    for gate_id, filename in release_artifacts:
+        exists = (cwd / filename).exists()
+        gates.append(
+            {
+                "gate_id": gate_id,
+                "description": f"Required release artifact exists: {filename}",
+                "status": "pass" if exists else "fail",
+                "checked_at": now,
+                "details": {"path": str((cwd / filename).as_posix()), "exists": exists},
+            }
+        )
+
+    runs_count = _count("SELECT COUNT(*) FROM runs")
+    decisions_count = _count("SELECT COUNT(*) FROM decisions")
+    outcomes_count = _count("SELECT COUNT(*) FROM outcomes")
+    gates.append(
+        {
+            "gate_id": "data_model_minimum_records",
+            "description": "Runs/decisions/outcomes records exist for MVP evidence",
+            "status": "pass" if (runs_count > 0 and decisions_count > 0 and outcomes_count > 0) else "warn",
+            "checked_at": now,
+            "details": {
+                "runs": runs_count,
+                "decisions": decisions_count,
+                "outcomes": outcomes_count,
+            },
+        }
+    )
+
+    trace_missing = _count("SELECT COUNT(*) FROM runs WHERE trace_path IS NULL OR trace_path = ''")
+    gates.append(
+        {
+            "gate_id": "trace_path_persisted",
+            "description": "All persisted runs include a trace path",
+            "status": "pass" if trace_missing == 0 else "fail",
+            "checked_at": now,
+            "details": {"runs_missing_trace_path": trace_missing},
+        }
+    )
+
+    rules_without_fallback = _count("SELECT COUNT(*) FROM promoted_rules WHERE fallback_enabled != 1")
+    gates.append(
+        {
+            "gate_id": "fallback_policy_preserved",
+            "description": "All stored promoted/rejected rules keep fallback enabled",
+            "status": "pass" if rules_without_fallback == 0 else "fail",
+            "checked_at": now,
+            "details": {"rules_without_fallback": rules_without_fallback},
+        }
+    )
+
+    if args.json:
+        for gate in gates:
+            print(json.dumps(gate, ensure_ascii=False))
+    else:
+        for gate in gates:
+            print(
+                f"[{str(gate['status']).upper()}] {gate['gate_id']}: {gate['description']}"
+            )
+            print(json.dumps(gate["details"], ensure_ascii=False))
+
+    has_failures = any(gate["status"] == "fail" for gate in gates)
+    if args.strict and has_failures:
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.command == "wrap":
@@ -1070,6 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rules_reject(args)
         if args.rules_command == "list":
             return cmd_rules_list(args)
+    if args.command == "release":
+        if args.release_command == "checklist":
+            return cmd_release_checklist(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 
