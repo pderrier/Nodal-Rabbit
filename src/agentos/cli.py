@@ -18,6 +18,7 @@ from .storage import (
     create_rule_id,
     create_run_id,
     ensure_schema,
+    get_latest_promoted_rule,
     get_decision,
     get_run,
     list_decision_choices,
@@ -44,14 +45,25 @@ DECISION_MARKER_RE = re.compile(
     re.DOTALL,
 )
 
+DEFAULT_CONFIG_PATH = "agentos.yaml"
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="agentos")
     sub = parser.add_subparsers(dest="command", required=True)
 
     wrap = sub.add_parser("wrap", help="Wrap an existing command and capture a minimal run trace")
-    wrap.add_argument("--intent", required=True)
+    wrap.add_argument("--intent")
     wrap.add_argument("--source", default="local-cli")
+    wrap.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    wrap.add_argument("--rule-first", action="store_true", default=False)
+    wrap.add_argument("--decision-key", help="Decision key used to match promoted rules in rule-first mode")
+    wrap.add_argument(
+        "--on-rule-match",
+        choices=("observe", "skip-fallback"),
+        default="observe",
+        help="When a promoted rule matches: observe (default) or skip process fallback",
+    )
     wrap.add_argument("--run-id")
     wrap.add_argument("--decision-file")
     wrap.add_argument("--parse-decision-markers", action="store_true", default=False)
@@ -127,6 +139,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     patterns_list.add_argument("--min-support", type=int, default=2)
     patterns_list.add_argument("--limit", type=int, default=20)
 
+    compile_cmd = sub.add_parser(
+        "compile",
+        help="Compilation workflow aliases (candidates/backtest/promote) aligned with MVP spec",
+    )
+    compile_sub = compile_cmd.add_subparsers(dest="compile_command", required=True)
+
+    compile_candidates = compile_sub.add_parser("candidates", help="Alias for patterns list")
+    compile_candidates.add_argument("--min-support", type=int, default=2)
+    compile_candidates.add_argument("--limit", type=int, default=20)
+
+    compile_backtest = compile_sub.add_parser("backtest", help="Alias for backtest run")
+    compile_backtest.add_argument("--decision-key", required=True)
+    compile_backtest.add_argument("--min-history", type=int, default=3)
+    compile_backtest.add_argument("--min-confidence", type=float, default=1.0)
+
+    compile_promote = compile_sub.add_parser("promote", help="Alias for rules promote")
+    compile_promote.add_argument("--decision-key", required=True)
+    compile_promote.add_argument("--min-history", type=int, default=3)
+    compile_promote.add_argument("--min-confidence", type=float, default=1.0)
+    compile_promote.add_argument("--min-accuracy", type=float, default=1.0)
+    compile_promote.add_argument("--rule-id")
+
+    compile_reject = compile_sub.add_parser("reject", help="Explicitly reject one deterministic candidate")
+    compile_reject.add_argument("--decision-key", required=True)
+    compile_reject.add_argument("--min-history", type=int, default=3)
+    compile_reject.add_argument("--min-confidence", type=float, default=1.0)
+    compile_reject.add_argument("--reason", default="manual_reject")
+    compile_reject.add_argument("--rule-id")
+
     backtest = sub.add_parser("backtest", help="Backtest deterministic decision rules")
     backtest_sub = backtest.add_subparsers(dest="backtest_command", required=True)
 
@@ -144,6 +185,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rules_promote.add_argument("--min-confidence", type=float, default=1.0)
     rules_promote.add_argument("--min-accuracy", type=float, default=1.0)
     rules_promote.add_argument("--rule-id")
+
+    rules_reject = rules_sub.add_parser("reject", help="Record an explicit rejection for one deterministic candidate")
+    rules_reject.add_argument("--decision-key", required=True)
+    rules_reject.add_argument("--min-history", type=int, default=3)
+    rules_reject.add_argument("--min-confidence", type=float, default=1.0)
+    rules_reject.add_argument("--reason", default="manual_reject")
+    rules_reject.add_argument("--rule-id")
 
     rules_list = rules_sub.add_parser("list", help="List promoted rules")
     rules_list.add_argument("--limit", type=int, default=20)
@@ -169,8 +217,90 @@ def _require_command_tail(cmd: list[str]) -> list[str]:
     return cmd
 
 
+def _parse_simple_yaml(raw: str) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    section: str | None = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line.startswith("  ") and section:
+            if ":" not in stripped:
+                continue
+            key, value = [part.strip() for part in stripped.split(":", 1)]
+            parsed_section = parsed.get(section)
+            if not isinstance(parsed_section, dict):
+                parsed_section = {}
+                parsed[section] = parsed_section
+            parsed_section[key] = _coerce_scalar(value)
+            continue
+        if ":" not in stripped:
+            continue
+        key, value = [part.strip() for part in stripped.split(":", 1)]
+        if value == "":
+            parsed[key] = {}
+            section = key
+        else:
+            parsed[key] = _coerce_scalar(value)
+            section = None
+    return parsed
+
+
+def _coerce_scalar(value: str) -> object:
+    normalized = value.strip().strip("'").strip('"')
+    lowered = normalized.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered.isdigit():
+        return int(lowered)
+    return normalized
+
+
+def _load_config(path: str) -> dict[str, object]:
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        return {}
+    raw = cfg_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+    parsed = _parse_simple_yaml(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _resolve_wrap_options(args: argparse.Namespace) -> dict[str, object]:
+    config = _load_config(args.config)
+    wrap_cfg = config.get("wrap", {}) if isinstance(config.get("wrap"), dict) else {}
+
+    intent = args.intent or wrap_cfg.get("intent")
+    if not isinstance(intent, str) or not intent.strip():
+        raise SystemExit("agentos wrap requires --intent or wrap.intent in agentos.yaml")
+
+    source = args.source
+    if source == "local-cli" and isinstance(wrap_cfg.get("source"), str):
+        source = str(wrap_cfg["source"])
+
+    capture_stdout = bool(args.capture_stdout or wrap_cfg.get("capture_stdout") is True)
+    capture_stderr = bool(args.capture_stderr or wrap_cfg.get("capture_stderr") is True)
+    rule_first = bool(args.rule_first or wrap_cfg.get("rule_first") is True)
+
+    return {
+        "intent": intent,
+        "source": source,
+        "capture_stdout": capture_stdout,
+        "capture_stderr": capture_stderr,
+        "rule_first": rule_first,
+    }
+
+
 def cmd_wrap(args: argparse.Namespace) -> int:
     command = _require_command_tail(args.cmd)
+    options = _resolve_wrap_options(args)
     home = resolve_home()
     conn = ensure_schema(home)
 
@@ -185,18 +315,73 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         run_id,
         "run_started",
         {
-            "intent": args.intent,
-            "source": args.source,
+            "intent": options["intent"],
+            "source": options["source"],
             "command": command,
-            "capture_stdout": bool(args.capture_stdout),
-            "capture_stderr": bool(args.capture_stderr),
+            "capture_stdout": options["capture_stdout"],
+            "capture_stderr": options["capture_stderr"],
+            "rule_first": options["rule_first"],
+            "decision_key": args.decision_key,
+            "on_rule_match": args.on_rule_match,
         },
     )
 
     env_payload = {"env": _redact_env(dict(os.environ))}
     record_event(conn, run_id, "env_snapshot", env_payload)
 
-    capture_output = bool(args.capture_stdout or args.capture_stderr or args.parse_decision_markers)
+    matched_rule = None
+    if options["rule_first"] and args.decision_key:
+        matched_rule = get_latest_promoted_rule(conn, decision_key=args.decision_key)
+        append_trace(
+            home,
+            run_id,
+            "rule_match_checked",
+            {"decision_key": args.decision_key, "matched": bool(matched_rule)},
+        )
+
+    if matched_rule is not None and args.on_rule_match == "skip-fallback":
+        duration_ms = int((time.perf_counter() - started_perf) * 1000)
+        finished_at = utc_now_iso()
+        append_trace(
+            home,
+            run_id,
+            "rule_applied",
+            {
+                "rule_id": matched_rule["rule_id"],
+                "decision_key": matched_rule["decision_key"],
+                "candidate_choice": matched_rule["candidate_choice"],
+                "fallback_skipped": True,
+            },
+        )
+        append_trace(
+            home,
+            run_id,
+            "run_finished",
+            {"exit_code": 0, "duration_ms": duration_ms, "fallback_skipped": True},
+        )
+        record_run(
+            conn,
+            RunRecord(
+                run_id=run_id,
+                intent=str(options["intent"]),
+                source=str(options["source"]),
+                command=shlex.join(command),
+                started_at=started_at,
+                finished_at=finished_at,
+                exit_code=0,
+                duration_ms=duration_ms,
+                trace_path=str((home / "runs" / run_id / "trace.jsonl").as_posix()),
+            ),
+        )
+        print(
+            json.dumps(
+                {"run_id": run_id, "exit_code": 0, "fallback_skipped": True, "rule_id": matched_rule["rule_id"]},
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    capture_output = bool(options["capture_stdout"] or options["capture_stderr"] or args.parse_decision_markers)
     proc = subprocess.run(
         command,
         text=True,
@@ -207,9 +392,9 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     duration_ms = int((time.perf_counter() - started_perf) * 1000)
     finished_at = utc_now_iso()
 
-    if args.capture_stdout:
+    if options["capture_stdout"]:
         append_trace(home, run_id, "stdout", {"content": proc.stdout or ""})
-    if args.capture_stderr:
+    if options["capture_stderr"]:
         append_trace(home, run_id, "stderr", {"content": proc.stderr or ""})
 
     append_trace(
@@ -223,8 +408,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         conn,
         RunRecord(
             run_id=run_id,
-            intent=args.intent,
-            source=args.source,
+            intent=str(options["intent"]),
+            source=str(options["source"]),
             command=shlex.join(command),
             started_at=started_at,
             finished_at=finished_at,
@@ -775,6 +960,51 @@ def cmd_rules_promote(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rules_reject(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    choices = list_decision_choices(conn, decision_key=args.decision_key)
+    metrics = _compute_backtest_metrics(
+        decision_key=args.decision_key,
+        choices=choices,
+        min_history=args.min_history,
+        min_confidence=args.min_confidence,
+    )
+    candidate_choice = str(metrics.get("candidate_choice", "__abstain__"))
+    rule_id = create_rule_id(args.rule_id)
+    record_promoted_rule(
+        conn,
+        PromotedRuleRecord(
+            rule_id=rule_id,
+            decision_key=args.decision_key,
+            candidate_choice=candidate_choice,
+            status="rejected",
+            fallback_enabled=True,
+            metrics_json=json.dumps(
+                {"reason": args.reason, "rejected": True, "metrics": metrics},
+                ensure_ascii=False,
+            ),
+            promoted_at=utc_now_iso(),
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "rejected": True,
+                "status": "rejected",
+                "rule_id": rule_id,
+                "decision_key": args.decision_key,
+                "candidate_choice": candidate_choice,
+                "reason": args.reason,
+                "fallback_enabled": True,
+                "metrics": metrics,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def cmd_rules_list(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
@@ -821,12 +1051,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "patterns":
         if args.patterns_command == "list":
             return cmd_patterns_list(args)
+    if args.command == "compile":
+        if args.compile_command == "candidates":
+            return cmd_patterns_list(args)
+        if args.compile_command == "backtest":
+            return cmd_backtest_run(args)
+        if args.compile_command == "promote":
+            return cmd_rules_promote(args)
+        if args.compile_command == "reject":
+            return cmd_rules_reject(args)
     if args.command == "backtest":
         if args.backtest_command == "run":
             return cmd_backtest_run(args)
     if args.command == "rules":
         if args.rules_command == "promote":
             return cmd_rules_promote(args)
+        if args.rules_command == "reject":
+            return cmd_rules_reject(args)
         if args.rules_command == "list":
             return cmd_rules_list(args)
     raise SystemExit(f"Unknown command: {args.command}")

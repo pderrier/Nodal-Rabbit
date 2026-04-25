@@ -64,6 +64,71 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(args.min_history, 4)
         self.assertEqual(args.min_confidence, 0.75)
 
+    def test_parse_args_compile_aliases(self) -> None:
+        args = parse_args(["compile", "candidates", "--min-support", "3", "--limit", "10"])
+        self.assertEqual(args.command, "compile")
+        self.assertEqual(args.compile_command, "candidates")
+        self.assertEqual(args.min_support, 3)
+        self.assertEqual(args.limit, 10)
+
+        args = parse_args(
+            [
+                "compile",
+                "backtest",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "4",
+                "--min-confidence",
+                "0.75",
+            ]
+        )
+        self.assertEqual(args.command, "compile")
+        self.assertEqual(args.compile_command, "backtest")
+        self.assertEqual(args.decision_key, "route.fix_ci")
+        self.assertEqual(args.min_history, 4)
+        self.assertEqual(args.min_confidence, 0.75)
+
+        args = parse_args(
+            [
+                "compile",
+                "promote",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "4",
+                "--min-confidence",
+                "0.8",
+                "--min-accuracy",
+                "0.9",
+            ]
+        )
+        self.assertEqual(args.command, "compile")
+        self.assertEqual(args.compile_command, "promote")
+        self.assertEqual(args.decision_key, "route.fix_ci")
+        self.assertEqual(args.min_history, 4)
+        self.assertEqual(args.min_confidence, 0.8)
+        self.assertEqual(args.min_accuracy, 0.9)
+
+        args = parse_args(
+            [
+                "compile",
+                "reject",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "4",
+                "--min-confidence",
+                "0.8",
+                "--reason",
+                "manual_review",
+            ]
+        )
+        self.assertEqual(args.command, "compile")
+        self.assertEqual(args.compile_command, "reject")
+        self.assertEqual(args.decision_key, "route.fix_ci")
+        self.assertEqual(args.reason, "manual_review")
+
     def test_parse_args_rules_promote(self) -> None:
         args = parse_args(
             [
@@ -509,6 +574,240 @@ class CLITestCase(unittest.TestCase):
         self.assertFalse(payload["promoted"])
         self.assertEqual(payload["status"], "abstain")
         self.assertTrue(payload["fallback_enabled"])
+
+    def test_compile_aliases_execute_candidates_backtest_and_promote(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.compile.aliases", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        for chosen in ["retry", "retry", "retry", "retry", "retry"]:
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "route.fix_ci",
+                    "--candidate",
+                    "true",
+                    "--data-json",
+                    json.dumps({"chosen": chosen}),
+                ]
+            )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
+
+        code, out, _ = self._run_cli(["compile", "candidates", "--min-support", "2", "--limit", "5"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(rows[0]["decision_key"], "route.fix_ci")
+        self.assertEqual(rows[0]["confidence"], 1.0)
+
+        code, out, _ = self._run_cli(
+            [
+                "compile",
+                "backtest",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "3",
+                "--min-confidence",
+                "0.8",
+            ]
+        )
+        self.assertEqual(code, 0)
+        backtest_payload = json.loads(out)
+        self.assertEqual(backtest_payload["decision_key"], "route.fix_ci")
+        self.assertEqual(backtest_payload["accuracy"], 1.0)
+
+        code, out, _ = self._run_cli(
+            [
+                "compile",
+                "promote",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "3",
+                "--min-confidence",
+                "0.8",
+                "--min-accuracy",
+                "1.0",
+            ]
+        )
+        self.assertEqual(code, 0)
+        promote_payload = json.loads(out)
+        self.assertTrue(promote_payload["promoted"])
+        self.assertEqual(promote_payload["status"], "promoted")
+
+    def test_compile_reject_records_rejected_rule(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.compile.reject", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        for chosen in ["retry", "retry", "escalate"]:
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "route.fix_ci",
+                    "--candidate",
+                    "true",
+                    "--data-json",
+                    json.dumps({"chosen": chosen}),
+                ]
+            )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "accepted",
+                "--data-json",
+                '{"result":"human_accepted"}',
+            ]
+        )
+
+        code, out, _ = self._run_cli(
+            [
+                "compile",
+                "reject",
+                "--decision-key",
+                "route.fix_ci",
+                "--reason",
+                "manual_review",
+            ]
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["rejected"])
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(payload["reason"], "manual_review")
+
+        code, out, _ = self._run_cli(["rules", "list", "--limit", "5"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(rows[0]["status"], "rejected")
+
+    def test_wrap_uses_agentos_yaml_defaults(self) -> None:
+        config_path = Path(self.temp_dir.name) / "agentos.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "wrap:",
+                    "  intent: demo.config.intent",
+                    "  source: config-source",
+                    "  capture_stdout: true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        cwd = os.getcwd()
+        os.chdir(self.temp_dir.name)
+        try:
+            code, out, _ = self._run_cli(["wrap", "--", "python", "-c", "print('ok')"])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, out, _ = self._run_cli(["runs", "show", run_id])
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload["intent"], "demo.config.intent")
+        self.assertEqual(payload["source"], "config-source")
+
+        code, out, _ = self._run_cli(["runs", "trace", run_id])
+        self.assertEqual(code, 0)
+        self.assertIn('"type": "stdout"', out)
+
+    def test_wrap_rule_first_can_skip_fallback_when_promoted_rule_matches(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.rule.first", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        for _ in range(5):
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "route.fix_ci",
+                    "--candidate",
+                    "true",
+                    "--data-json",
+                    '{"chosen":"retry"}',
+                ]
+            )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
+        self._run_cli(
+            [
+                "rules",
+                "promote",
+                "--decision-key",
+                "route.fix_ci",
+                "--min-history",
+                "3",
+                "--min-confidence",
+                "0.8",
+                "--min-accuracy",
+                "1.0",
+                "--rule-id",
+                "rule_skip_fallback",
+            ]
+        )
+
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.rule.first.skip",
+                "--rule-first",
+                "--decision-key",
+                "route.fix_ci",
+                "--on-rule-match",
+                "skip-fallback",
+                "--",
+                "python",
+                "-c",
+                "import sys; sys.exit(33)",
+            ]
+        )
+        self.assertEqual(code, 0)
+        payload = json.loads(out)
+        self.assertTrue(payload["fallback_skipped"])
+        self.assertEqual(payload["rule_id"], "rule_skip_fallback")
 
     def test_wrap_ingests_decision_file_and_outcome(self) -> None:
         artifact_dir = Path(self.temp_dir.name) / "agentos-artifacts"

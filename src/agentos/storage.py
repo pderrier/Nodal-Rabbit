@@ -394,3 +394,18 @@ def list_promoted_rules(conn: sqlite3.Connection, limit: int = 20) -> list[sqlit
         (limit,),
     )
     return list(cursor.fetchall())
+
+
+def get_latest_promoted_rule(conn: sqlite3.Connection, decision_key: str) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        SELECT rule_id, decision_key, candidate_choice, status, fallback_enabled, metrics_json, promoted_at
+        FROM promoted_rules
+        WHERE decision_key = ? AND status = 'promoted'
+        ORDER BY promoted_at DESC
+        LIMIT 1
+        """,
+        (decision_key,),
+    )
+    return cursor.fetchone()
