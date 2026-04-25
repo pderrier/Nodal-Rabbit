@@ -8,19 +8,26 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from collections import Counter
 
 from .storage import (
+    PromotedRuleRecord,
     RunRecord,
     append_trace,
+    create_rule_id,
     create_run_id,
     ensure_schema,
     get_decision,
     get_run,
+    list_decision_choices,
+    list_decision_patterns,
     list_decisions,
+    list_promoted_rules,
     list_runs,
     record_decision,
     record_event,
     record_outcome,
+    record_promoted_rule,
     record_run,
     resolve_home,
     utc_now_iso,
@@ -88,6 +95,37 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="{}",
         help="JSON payload for this outcome (default: {})",
     )
+
+    patterns = sub.add_parser(
+        "patterns",
+        help="Detect repeated decision patterns for deterministic rule candidates",
+    )
+    patterns_sub = patterns.add_subparsers(dest="patterns_command", required=True)
+
+    patterns_list = patterns_sub.add_parser("list", help="List repeated decision patterns")
+    patterns_list.add_argument("--min-support", type=int, default=2)
+    patterns_list.add_argument("--limit", type=int, default=20)
+
+    backtest = sub.add_parser("backtest", help="Backtest deterministic decision rules")
+    backtest_sub = backtest.add_subparsers(dest="backtest_command", required=True)
+
+    backtest_run = backtest_sub.add_parser("run", help="Run walk-forward backtest for one decision key")
+    backtest_run.add_argument("--decision-key", required=True)
+    backtest_run.add_argument("--min-history", type=int, default=3)
+    backtest_run.add_argument("--min-confidence", type=float, default=1.0)
+
+    rules = sub.add_parser("rules", help="Promote and inspect deterministic rules with fallback")
+    rules_sub = rules.add_subparsers(dest="rules_command", required=True)
+
+    rules_promote = rules_sub.add_parser("promote", help="Promote one deterministic candidate with metrics")
+    rules_promote.add_argument("--decision-key", required=True)
+    rules_promote.add_argument("--min-history", type=int, default=3)
+    rules_promote.add_argument("--min-confidence", type=float, default=1.0)
+    rules_promote.add_argument("--min-accuracy", type=float, default=1.0)
+    rules_promote.add_argument("--rule-id")
+
+    rules_list = rules_sub.add_parser("list", help="List promoted rules")
+    rules_list.add_argument("--limit", type=int, default=20)
 
     return parser.parse_args(argv)
 
@@ -331,6 +369,191 @@ def cmd_outcome_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_patterns_list(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    rows = list_decision_patterns(conn, min_support=args.min_support, limit=args.limit)
+    for row in rows:
+        confidence = float(row["confidence"])
+        abstain_rate = max(0.0, 1.0 - confidence)
+        print(
+            json.dumps(
+                {
+                    "decision_key": row["decision_key"],
+                    "dominant_choice": row["dominant_choice"],
+                    "support": row["support"],
+                    "dominant_count": row["dominant_count"],
+                    "confidence": confidence,
+                    "abstain_rate": round(abstain_rate, 6),
+                    "promote_ready": confidence == 1.0,
+                },
+                ensure_ascii=False,
+            )
+        )
+    return 0
+
+
+def _dominant_choice(choices: list[str]) -> tuple[str, float]:
+    counts = Counter(choices)
+    winner, winner_count = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+    return winner, winner_count / len(choices)
+
+
+def _compute_backtest_metrics(
+    decision_key: str,
+    choices: list[str],
+    min_history: int,
+    min_confidence: float,
+) -> dict[str, object]:
+    total = len(choices)
+    if total < 2:
+        return {
+            "decision_key": decision_key,
+            "error": "not_enough_data",
+            "total_observations": total,
+        }
+
+    correct = 0
+    predicted = 0
+    abstained = 0
+
+    for idx in range(total):
+        if idx < min_history:
+            abstained += 1
+            continue
+
+        history = choices[:idx]
+        dominant, confidence = _dominant_choice(history)
+        if confidence < min_confidence:
+            abstained += 1
+            continue
+
+        predicted += 1
+        if choices[idx] == dominant:
+            correct += 1
+
+    final_dominant, final_confidence = _dominant_choice(choices)
+    accuracy = (correct / predicted) if predicted else 0.0
+    abstain_rate = abstained / total
+    coverage_rate = predicted / total
+
+    return {
+        "decision_key": decision_key,
+        "total_observations": total,
+        "min_history": min_history,
+        "min_confidence": min_confidence,
+        "candidate_choice": final_dominant,
+        "candidate_confidence": round(final_confidence, 6),
+        "predictions": predicted,
+        "abstentions": abstained,
+        "correct_predictions": correct,
+        "accuracy": round(accuracy, 6),
+        "abstain_rate": round(abstain_rate, 6),
+        "coverage_rate": round(coverage_rate, 6),
+        "promote_ready": predicted > 0 and accuracy == 1.0,
+    }
+
+
+def cmd_backtest_run(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    choices = list_decision_choices(conn, decision_key=args.decision_key)
+    metrics = _compute_backtest_metrics(
+        decision_key=args.decision_key,
+        choices=choices,
+        min_history=args.min_history,
+        min_confidence=args.min_confidence,
+    )
+    print(json.dumps(metrics, ensure_ascii=False))
+    return 0
+
+
+def cmd_rules_promote(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    choices = list_decision_choices(conn, decision_key=args.decision_key)
+    metrics = _compute_backtest_metrics(
+        decision_key=args.decision_key,
+        choices=choices,
+        min_history=args.min_history,
+        min_confidence=args.min_confidence,
+    )
+    if metrics.get("error") == "not_enough_data":
+        print(
+            json.dumps(
+                {
+                    "promoted": False,
+                    "status": "abstain",
+                    "reason": "not_enough_data",
+                    "fallback_enabled": True,
+                    "metrics": metrics,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    accuracy = float(metrics["accuracy"])
+    predictions = int(metrics["predictions"])
+    candidate_choice = str(metrics["candidate_choice"])
+    can_promote = predictions > 0 and accuracy >= args.min_accuracy
+    status = "promoted" if can_promote else "abstain"
+
+    rule_id = create_rule_id(args.rule_id) if can_promote else None
+    if can_promote and rule_id:
+        record_promoted_rule(
+            conn,
+            PromotedRuleRecord(
+                rule_id=rule_id,
+                decision_key=args.decision_key,
+                candidate_choice=candidate_choice,
+                status=status,
+                fallback_enabled=True,
+                metrics_json=json.dumps(metrics, ensure_ascii=False),
+                promoted_at=utc_now_iso(),
+            ),
+        )
+
+    print(
+        json.dumps(
+            {
+                "promoted": can_promote,
+                "status": status,
+                "rule_id": rule_id,
+                "decision_key": args.decision_key,
+                "candidate_choice": candidate_choice,
+                "min_accuracy": args.min_accuracy,
+                "fallback_enabled": True,
+                "metrics": metrics,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def cmd_rules_list(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    rows = list_promoted_rules(conn, limit=args.limit)
+    for row in rows:
+        print(
+            json.dumps(
+                {
+                    "rule_id": row["rule_id"],
+                    "decision_key": row["decision_key"],
+                    "candidate_choice": row["candidate_choice"],
+                    "status": row["status"],
+                    "fallback_enabled": bool(row["fallback_enabled"]),
+                    "metrics_json": json.loads(row["metrics_json"]),
+                    "promoted_at": row["promoted_at"],
+                },
+                ensure_ascii=False,
+            )
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.command == "wrap":
@@ -352,6 +575,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "outcome":
         if args.outcome_command == "record":
             return cmd_outcome_record(args)
+    if args.command == "patterns":
+        if args.patterns_command == "list":
+            return cmd_patterns_list(args)
+    if args.command == "backtest":
+        if args.backtest_command == "run":
+            return cmd_backtest_run(args)
+    if args.command == "rules":
+        if args.rules_command == "promote":
+            return cmd_rules_promote(args)
+        if args.rules_command == "list":
+            return cmd_rules_list(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 
