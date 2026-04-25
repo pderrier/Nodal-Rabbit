@@ -19,11 +19,20 @@ Core loop (must remain intact):
 
 ```text
 wrap existing process
-→ trace decisions
+→ capture declared decisions
+→ validate decisions and outcomes
 → detect repeated patterns
 → backtest deterministic rules
 → promote rules
 → run rule-first with fallback
+```
+
+Guiding constraints (MVP):
+
+```text
+Run capture is automatic.
+Decision capture is declarative.
+Compilation requires validated decisions and outcomes.
 ```
 
 ---
@@ -55,13 +64,20 @@ Users must be able to keep:
 
 AgentOS adds:
 - run traces,
-- decision traces,
+- declared decision traces,
 - outcome tracking,
 - compilation candidates,
 - backtesting,
 - deterministic promotion,
 - rule-first runtime,
 - fallback to existing process.
+
+Decision honesty rule:
+
+```text
+AgentOS does not infer hidden LLM decisions.
+It captures declared operational decisions through files, stdout markers, or explicit instrumentation.
+```
 
 ---
 
@@ -160,30 +176,88 @@ script:
 With AgentOS:
 
 ```yaml
-script:
-  - pip install agentos
-  - agentos wrap \
-      --intent "$AGENTOS_INTENT" \
-      --source gitlab-ci \
-      --run-id "$CI_PIPELINE_ID-$CI_JOB_ID" \
-      --artifact-dir agentos-artifacts \
-      -- ./scripts/run-codex-investigation.sh
+investigation-agent:
+  stage: investigate
+  image: registry.example.com/agents/codex-runner:latest
+  variables:
+    AGENTOS_INTENT: "gitlab.fix_ci"
+    AGENTOS_SOURCE: "gitlab-ci"
+    AGENTOS_RUN_ID: "$CI_PIPELINE_ID-$CI_JOB_ID"
+  script:
+    - pip install agentos
+    - mkdir -p agentos-artifacts
+    - agentos wrap \
+        --intent "$AGENTOS_INTENT" \
+        --source "$AGENTOS_SOURCE" \
+        --run-id "$AGENTOS_RUN_ID" \
+        --artifact-dir agentos-artifacts \
+        --decision-file agentos-artifacts/decisions.json \
+        -- ./scripts/run-codex-investigation.sh
+  artifacts:
+    when: always
+    paths:
+      - agentos-artifacts/
 ```
 
 Invariant: wrapper integration must not require rewriting the underlying script.
 
+Wrapper contract:
+
+```text
+The wrapper captures runs. Decisions require a decision channel.
+```
+
+Note:
+
+```text
+The existing script can initially ignore AgentOS. In that case only the run is captured.
+To make decisions compilable, the script should write `agentos-artifacts/decisions.json` or emit decision markers.
+```
+
 ---
 
-## 4) Reproducible intent and compilation candidacy
+## 4) Wrapper promise and compilation candidacy
 
-A decision is a compilation candidate only if all are true:
-1. repeated pattern exists,
-2. inputs are stable or fingerprintable,
-3. outputs are identical or compatible,
-4. outcomes are mostly successful,
-5. risk is low/bounded,
+Correct capture model:
+
+```text
+agentos wrap alone captures:
+- command
+- run id
+- intent label
+- source metadata
+- stdout/stderr
+- exit code
+- duration
+- artifacts
+- selected environment metadata
+
+agentos wrap alone does NOT reliably capture:
+- hidden LLM reasoning
+- implicit LLM choices
+- operational decisions unless they are declared
+```
+
+Replace any magical introspection framing with:
+
+```text
+AgentOS records what the process explicitly reports as an operational decision.
+```
+
+Compilation candidate baseline requirements:
+1. decision was explicitly declared through a supported decision channel,
+2. decision schema is valid,
+3. output is structured and compilation_candidate=true,
+4. associated outcome exists,
+5. outcome is successful or explicitly accepted,
 6. generated rule can abstain safely,
 7. fallback remains available.
+
+Warning:
+
+```text
+Passive run traces can be useful for debugging and later manual analysis, but they must not be used as trusted compilation data unless operational decisions have been explicitly declared and validated.
+```
 
 Rule quality preference order:
 1. high precision,
@@ -197,6 +271,14 @@ Do not optimize for broad matching in MVP.
 ---
 
 ## 5) Compilation maturity levels
+
+MVP P0 priorities:
+- P0 — Run capture via `agentos wrap`
+- P0 — Decision capture through declared decision channels
+- P0 — Decision schema validation
+- P0 — Outcome capture
+- P0 — Compilation only from validated declared decisions
+- P0 — Backtesting and explicit promotion
 
 - Level 0: LLM/process every time.
 - Level 1: deterministic routing/classification before fallback.
@@ -278,14 +360,193 @@ Trace file:
 .agentos/runs/<run_id>/trace.jsonl
 ```
 
+Implementation hint for source/validity tracking:
+
+```text
+DecisionSource:
+- decision_file
+- stdout_marker
+- cli_record
+- sdk_record
+- passive_trace
+
+DecisionValidity:
+- valid
+- invalid_schema
+- missing_step_id
+- missing_output
+- missing_input_ref
+- invalid_confidence
+- missing_outcome
+```
+
+Trusted compilation queries should filter to declared sources (`decision_file`, `stdout_marker`, `cli_record`, `sdk_record`) and exclude `passive_trace`.
+
 ---
 
-## 9) Required MVP CLI surface
+## 9) Decision capture channels
+
+### Channel A — decision file (recommended)
+
+```bash
+agentos wrap \
+  --intent gitlab.fix_ci \
+  --decision-file agentos-artifacts/decisions.json \
+  -- ./run-existing-agent.sh
+```
+
+```json
+{
+  "decisions": [
+    {
+      "step_id": "classify_failure",
+      "decision_type": "llm",
+      "input_refs": ["job-log.txt"],
+      "output": {
+        "failure_type": "eslint_unused_variable",
+        "confidence": 0.94
+      },
+      "evidence": ["CI log contains no-unused-vars"],
+      "compilation_candidate": true
+    }
+  ],
+  "outcome": {
+    "status": "success",
+    "tests_passed": true,
+    "patch_created": true
+  }
+}
+```
+
+Why channel A in P0:
+- best compromise for existing Codex/Claude headless prompts,
+- simple to adopt,
+- robust enough for MVP,
+- can be generated by script or by the LLM when prompt-enforced.
+
+### Channel B — stdout markers
+
+```text
+===AGENTOS_DECISION_START===
+{
+  "step_id": "classify_failure",
+  "decision_type": "llm",
+  "input_refs": ["job-log.txt"],
+  "output": {
+    "failure_type": "eslint_unused_variable",
+    "confidence": 0.94
+  },
+  "evidence": ["CI log contains no-unused-vars"],
+  "compilation_candidate": true
+}
+===AGENTOS_DECISION_END===
+```
+
+```bash
+agentos wrap \
+  --intent gitlab.fix_ci \
+  --parse-decision-markers \
+  -- ./run-existing-agent.sh
+```
+
+Use when process cannot write files. This is less robust than a decision file, but still requires schema validation before compilation.
+
+### Channel C — explicit CLI/SDK instrumentation
+
+```bash
+agentos decision record \
+  --step classify_failure \
+  --type llm \
+  --input-file job-log.txt \
+  --output-file classification.json \
+  --candidate true
+```
+
+```python
+from agentos import decision
+
+decision.record(
+    step_id="classify_failure",
+    decision_type="llm",
+    input_ref="job-log.txt",
+    output={
+        "failure_type": "eslint_unused_variable",
+        "confidence": 0.94,
+        "evidence": ["CI log contains no-unused-vars"],
+    },
+    compilation_candidate=True,
+)
+```
+
+Most reliable mechanism; best for Python/Node scripts; still optional for zero-rewrite adoption.
+
+---
+
+## 10) Decision validation
+
+A declared decision is valid only if:
+
+```text
+- JSON/schema is valid
+- `step_id` is present
+- `decision_type` is one of: rule, llm, human, script, verifier
+- `output` is structured
+- confidence, if present, is between 0 and 1
+- input_refs or input_fingerprint is present when applicable
+- evidence is present or explicitly empty
+- compilation_candidate is boolean
+```
+
+Invalid decisions must be stored as raw artifacts or invalid decision records, visible in traces, and excluded from compilation candidates.
+
+Hard rule:
+
+```text
+Only valid declared decisions can become compilation candidates.
+```
+
+---
+
+## 11) Outcome capture
+
+Supported methods:
+
+### Outcome in decision file
+
+```json
+{
+  "outcome": {
+    "status": "success",
+    "tests_passed": true,
+    "patch_created": true,
+    "summary": "Patch fixed eslint failure"
+  }
+}
+```
+
+### Outcome CLI
+
+```bash
+agentos outcome record \
+  --status success \
+  --tests-passed \
+  --summary "Patch fixed eslint failure"
+```
+
+```text
+Without outcome data, AgentOS can know that a decision was made, but not whether it was a good decision.
+Therefore, decisions without outcome can be stored and inspected, but should not be promoted automatically and should not count as high-confidence compilation examples.
+```
+
+---
+
+## 12) Required MVP CLI surface
 
 ### 9.1 Wrapping
 
 ```bash
-agentos wrap --intent <intent> -- <command...>
+agentos wrap --intent <intent> --decision-file <path> -- <command...>
+agentos wrap --intent <intent> --parse-decision-markers -- <command...>
 ```
 
 Options required in MVP:
@@ -299,6 +560,20 @@ Options required in MVP:
 - `--capture-stderr`
 - `--redact-env`
 - `--rule-first`
+- `--decision-file <path>`
+- `--parse-decision-markers`
+- `--strict-decisions`
+- `--allow-invalid-decisions`
+
+Decision option behavior:
+
+```text
+--strict-decisions:
+  fail the wrapper if a declared decision file exists but is invalid.
+
+default:
+  keep process result, store invalid decision as invalid, exclude from compilation.
+```
 
 ### 9.2 Decision recording
 
@@ -358,7 +633,35 @@ agentos compile reject <candidate_id>
 
 ---
 
-## 10) Candidate detection and backtest contracts
+## 13) Candidate detection and backtest contracts
+
+Compilation candidates must be built from:
+- declared decisions,
+- valid decision schemas,
+- associated outcomes,
+- successful or explicitly accepted results.
+
+Hard rule:
+
+```text
+Passive stdout/stderr inference must not create trusted compilation candidates in MVP.
+```
+
+Candidate detection must ignore:
+- invalid decisions,
+- decisions without output schema,
+- decisions without associated outcome,
+- decisions marked `compilation_candidate=false`,
+- decisions from failed runs unless explicitly configured.
+
+Trusted candidate query contract:
+
+```text
+source in decision_file/stdout_marker/cli_record/sdk_record
+validity = valid
+compilation_candidate = true
+outcome.status in success/accepted
+```
 
 Default candidate detection thresholds (configurable):
 
@@ -394,25 +697,62 @@ No auto-promotion in MVP.
 
 ---
 
-## 11) First vertical slice (must be demo-ready)
+## 14) First vertical slice (must be demo-ready)
 
 Scenario:
-1. Existing script simulates headless agent.
-2. `agentos wrap` captures run.
-3. Script optionally records structured decision.
-4. Repetition generates candidate.
-5. Candidate backtested.
-6. Candidate promoted.
-7. Future run uses rule-first.
-8. Existing script remains fallback by default.
+1. Existing script is run through `agentos wrap`.
+2. Script writes `agentos-artifacts/decisions.json`.
+3. AgentOS loads and validates the decision file.
+4. AgentOS stores valid decisions and outcome.
+5. Several sample runs produce similar declared decisions.
+6. `agentos compile candidates` groups repeated valid successful decisions.
+7. `agentos compile backtest <candidate_id>` tests a proposed rule against historical declared decisions.
+8. `agentos compile promote <candidate_id>` promotes the rule.
+9. Future `agentos wrap --rule-first` checks promoted rules first.
+10. Existing process remains fallback by default.
+
+Minimal example script (`run-existing-agent.sh`):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p agentos-artifacts
+
+cat > agentos-artifacts/decisions.json <<'JSON'
+{
+  "decisions": [
+    {
+      "step_id": "classify_failure",
+      "decision_type": "llm",
+      "input_refs": ["job-log.txt"],
+      "output": {
+        "failure_type": "eslint_unused_variable",
+        "confidence": 0.94
+      },
+      "evidence": ["CI log contains no-unused-vars"],
+      "compilation_candidate": true
+    }
+  ],
+  "outcome": {
+    "status": "success",
+    "tests_passed": true,
+    "patch_created": true,
+    "summary": "Patch fixed eslint failure"
+  }
+}
+JSON
+
+echo "Simulated existing agent completed"
+```
 
 Demo commands:
 
 ```bash
 agentos wrap \
   --intent gitlab.fix_ci \
-  --artifact-dir .agentos/artifacts \
-  -- examples/gitlab-ci/run-existing-agent.sh
+  --decision-file agentos-artifacts/decisions.json \
+  -- ./run-existing-agent.sh
 ```
 
 ```bash
@@ -425,18 +765,19 @@ agentos compile promote <candidate_id>
 agentos wrap \
   --intent gitlab.fix_ci \
   --rule-first \
-  -- examples/gitlab-ci/run-existing-agent.sh
+  --decision-file agentos-artifacts/decisions.json \
+  -- ./run-existing-agent.sh
 ```
 
 Expected outcomes:
 - rule applied when matching,
-- deterministic decision recorded,
+- only validated declared decisions considered for trusted compilation,
 - wrapped script still executes by default,
 - fallback invariant preserved.
 
 ---
 
-## 12) AGENTS.md directives for implementation agents
+## 15) AGENTS.md directives for implementation agents
 
 The repository AGENTS.md must instruct coding agents:
 - Do not build a coding agent.
@@ -451,31 +792,37 @@ The repository AGENTS.md must instruct coding agents:
 - Do not hide safety only in prompts.
 - Do not claim sandboxing in MVP.
 - Do not add heavy dependencies without strong justification.
+- Never claim hidden LLM reasoning capture from wrapping alone.
+- Treat decisions as compilable only when declared, validated, and outcome-linked.
+- Allow passive traces for debugging only; never as trusted compilation input in MVP.
 
 ---
 
-## 13) Acceptance criteria for MVP v0.3
+## 16) Acceptance criteria for MVP v0.3
 
-MVP is successful only if:
-1. Existing scripts run unchanged under `agentos wrap`.
-2. Runs/events/decisions/outcomes are queryable locally.
-3. Repeated patterns produce compilation candidates.
-4. Backtest metrics are computed and persisted.
-5. Promotion is explicit and versioned.
-6. `--rule-first` works with fallback-on by default.
-7. Safety behavior matches declared non-sandbox scope.
+MVP succeeds if:
+- it wraps an existing process without requiring a rewrite,
+- it captures run metadata automatically,
+- it supports at least one declared decision channel,
+- it validates declared decisions,
+- it captures outcomes,
+- it excludes invalid or undeclared decisions from compilation,
+- it detects repeated valid successful decisions,
+- it backtests a candidate rule,
+- it promotes a rule explicitly,
+- future runs can use promoted rules before fallback.
 
-MVP is not successful if:
-- users must rewrite workflows,
-- AgentOS replaces Codex/Claude instead of wrapping,
-- orchestration is built before compilation proof,
-- fallback is removed by default,
-- sandboxing is claimed but absent.
+MVP fails if:
+- it claims to capture hidden LLM decisions,
+- it compiles from unstructured stdout guesses,
+- it requires a full migration to a new workflow runtime,
+- it replaces existing agents instead of wrapping them,
+- it lacks a clear fallback path.
 
 ---
 
 
-## 14) Reference repository layout (MVP target)
+## 17) Reference repository layout (MVP target)
 
 ```text
 agentos/
@@ -545,7 +892,7 @@ Roadmap and delivery sequence are maintained in `BACKLOG_MVP_PRIORISE_ROADMAP_6_
 
 ---
 
-## 15) Changelog (v0.2 → v0.3)
+## 18) Changelog (v0.2 → v0.3)
 
 - Consolidated MVP authority into `agentos_mvp_v0_3.md`; v0.2 content is superseded.
 - Clarified strict non-goals (no coding agent/chatbot/workflow platform in MVP).
@@ -561,7 +908,7 @@ Roadmap and delivery sequence are maintained in `BACKLOG_MVP_PRIORISE_ROADMAP_6_
 
 ---
 
-## 16) Anti-drift checklist (required in PR reviews)
+## 19) Anti-drift checklist (required in PR reviews)
 
 - [ ] Does this keep one-command wrapper adoption for existing scripts/jobs?
 - [ ] Does this wrap Codex/Claude/scripts instead of replacing them?
@@ -575,7 +922,8 @@ Roadmap and delivery sequence are maintained in `BACKLOG_MVP_PRIORISE_ROADMAP_6_
 
 ```text
 wrap existing process
-→ trace decisions
+→ capture declared decisions
+→ validate decisions and outcomes
 → detect repeated patterns
 → backtest deterministic rules
 → promote rules

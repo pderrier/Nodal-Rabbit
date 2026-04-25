@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -35,6 +36,13 @@ from .storage import (
 
 
 REDACT_PATTERNS = ("TOKEN", "SECRET", "PASSWORD", "KEY")
+DECISION_SOURCES = ("decision_file", "stdout_marker", "cli_record", "sdk_record", "passive_trace")
+DECISION_TYPES = ("rule", "llm", "human", "script", "verifier")
+VALID_DECISION_SOURCES = {"decision_file", "stdout_marker", "cli_record", "sdk_record"}
+DECISION_MARKER_RE = re.compile(
+    r"===AGENTOS_DECISION_START===\s*(\{.*?\})\s*===AGENTOS_DECISION_END===",
+    re.DOTALL,
+)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -45,6 +53,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     wrap.add_argument("--intent", required=True)
     wrap.add_argument("--source", default="local-cli")
     wrap.add_argument("--run-id")
+    wrap.add_argument("--decision-file")
+    wrap.add_argument("--parse-decision-markers", action="store_true", default=False)
+    wrap.add_argument("--strict-decisions", action="store_true", default=False)
+    wrap.add_argument("--allow-invalid-decisions", action="store_true", default=True)
     wrap.add_argument("--capture-stdout", action="store_true", default=False)
     wrap.add_argument("--capture-stderr", action="store_true", default=False)
     wrap.add_argument("cmd", nargs=argparse.REMAINDER)
@@ -67,6 +79,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     decision_record = decision_sub.add_parser("record", help="Record one decision event")
     decision_record.add_argument("--run-id", help="Defaults to AGENTOS_RUN_ID if omitted")
     decision_record.add_argument("--key", dest="decision_key", help="Decision key/fingerprint")
+    decision_record.add_argument("--step", dest="step_id")
+    decision_record.add_argument("--type", dest="decision_type", choices=DECISION_TYPES)
+    decision_record.add_argument("--source", dest="decision_source", choices=DECISION_SOURCES, default="cli_record")
+    decision_record.add_argument("--input-file", dest="input_refs", action="append", default=[])
+    decision_record.add_argument("--input-fingerprint")
+    decision_record.add_argument("--output-json", default=None)
+    decision_record.add_argument("--output-file", default=None)
+    decision_record.add_argument("--evidence-json", default=None)
+    decision_record.add_argument("--candidate", choices=("true", "false"), default=None)
     decision_record.add_argument(
         "--data-json",
         default="{}",
@@ -87,7 +108,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     outcome_record.add_argument(
         "--status",
         required=True,
-        choices=("success", "failure", "unknown"),
+        choices=("success", "accepted", "failure", "unknown"),
         help="Outcome status",
     )
     outcome_record.add_argument(
@@ -175,10 +196,11 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     env_payload = {"env": _redact_env(dict(os.environ))}
     record_event(conn, run_id, "env_snapshot", env_payload)
 
+    capture_output = bool(args.capture_stdout or args.capture_stderr or args.parse_decision_markers)
     proc = subprocess.run(
         command,
         text=True,
-        capture_output=(args.capture_stdout or args.capture_stderr),
+        capture_output=capture_output,
         check=False,
     )
 
@@ -211,6 +233,27 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             trace_path=str((home / "runs" / run_id / "trace.jsonl").as_posix()),
         ),
     )
+
+    invalid_declared = False
+    if args.decision_file:
+        invalid_declared = _ingest_decision_file(home, conn, run_id, args.decision_file, allow_invalid=args.allow_invalid_decisions) or invalid_declared
+    if args.parse_decision_markers:
+        invalid_declared = _ingest_stdout_markers(
+            home=home,
+            conn=conn,
+            run_id=run_id,
+            stdout=proc.stdout or "",
+            allow_invalid=args.allow_invalid_decisions,
+        ) or invalid_declared
+
+    if args.strict_decisions and invalid_declared:
+        print(
+            json.dumps(
+                {"run_id": run_id, "exit_code": proc.returncode, "decision_error": "invalid_declared_decision"},
+                ensure_ascii=False,
+            )
+        )
+        return 2
 
     print(json.dumps({"run_id": run_id, "exit_code": proc.returncode}, ensure_ascii=False))
     return proc.returncode
@@ -274,26 +317,220 @@ def _resolve_run_id(run_id: str | None) -> str:
     return resolved
 
 
-def cmd_decision_record(args: argparse.Namespace) -> int:
-    home = resolve_home()
-    conn = ensure_schema(home)
-    run_id = _resolve_run_id(args.run_id)
-    payload = _load_json_payload(args.data_json)
+def _to_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _validate_declared_decision(payload: dict[str, object]) -> str:
+    step_id = payload.get("step_id")
+    if not isinstance(step_id, str) or not step_id.strip():
+        return "missing_step_id"
+    decision_type = payload.get("decision_type")
+    if decision_type not in DECISION_TYPES:
+        return "invalid_schema"
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return "missing_output"
+    confidence = output.get("confidence")
+    if confidence is not None:
+        if not isinstance(confidence, (float, int)) or confidence < 0 or confidence > 1:
+            return "invalid_confidence"
+    has_input = isinstance(payload.get("input_refs"), list) and len(payload["input_refs"]) > 0
+    has_fingerprint = isinstance(payload.get("input_fingerprint"), str) and bool(payload["input_fingerprint"].strip())
+    if not (has_input or has_fingerprint):
+        return "missing_input_ref"
+    if "evidence" not in payload:
+        return "invalid_schema"
+    evidence = payload.get("evidence")
+    if evidence is not None and not isinstance(evidence, list):
+        return "invalid_schema"
+    candidate = _to_bool(payload.get("compilation_candidate"))
+    if candidate is None:
+        return "invalid_schema"
+    return "valid"
+
+
+def _record_declared_decision(
+    *,
+    home: Path,
+    conn,
+    run_id: str,
+    payload: dict[str, object],
+    source: str,
+    allow_invalid: bool,
+) -> bool:
+    validity = _validate_declared_decision(payload)
+    if validity != "valid" and not allow_invalid:
+        return True
+    candidate = _to_bool(payload.get("compilation_candidate")) is True
+    decision_key = str(payload.get("step_id")) if payload.get("step_id") else None
     decision_id = record_decision(
         conn=conn,
         run_id=run_id,
-        decision_key=args.decision_key,
+        decision_key=decision_key,
         payload=payload,
+        decision_source=source,
+        decision_validity=validity,
+        compilation_candidate=candidate,
     )
     append_trace(
         home,
         run_id,
         "decision_recorded",
-        {"decision_id": decision_id, "decision_key": args.decision_key, "payload": payload},
+        {
+            "decision_id": decision_id,
+            "decision_key": decision_key,
+            "decision_source": source,
+            "decision_validity": validity,
+            "compilation_candidate": candidate,
+        },
+    )
+    return validity != "valid"
+
+
+def _ingest_decision_file(home: Path, conn, run_id: str, decision_file: str, allow_invalid: bool) -> bool:
+    path = Path(decision_file)
+    if not path.exists():
+        append_trace(home, run_id, "decision_file_missing", {"path": decision_file})
+        return True
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        append_trace(home, run_id, "decision_file_invalid_json", {"path": decision_file})
+        return True
+    if not isinstance(payload, dict):
+        append_trace(home, run_id, "decision_file_invalid_shape", {"path": decision_file})
+        return True
+
+    invalid = False
+    decisions = payload.get("decisions", [])
+    if isinstance(decisions, list):
+        for decision in decisions:
+            if isinstance(decision, dict):
+                invalid = _record_declared_decision(
+                    home=home,
+                    conn=conn,
+                    run_id=run_id,
+                    payload=decision,
+                    source="decision_file",
+                    allow_invalid=allow_invalid,
+                ) or invalid
+            else:
+                invalid = True
+    else:
+        invalid = True
+
+    outcome = payload.get("outcome")
+    if isinstance(outcome, dict):
+        status = outcome.get("status")
+        if status in {"success", "accepted", "failure", "unknown"}:
+            record_outcome(conn=conn, run_id=run_id, status=str(status), payload=outcome)
+            append_trace(home, run_id, "outcome_recorded", {"status": status, "source": "decision_file"})
+        else:
+            invalid = True
+    return invalid
+
+
+def _ingest_stdout_markers(*, home: Path, conn, run_id: str, stdout: str, allow_invalid: bool) -> bool:
+    invalid = False
+    for match in DECISION_MARKER_RE.finditer(stdout):
+        block = match.group(1)
+        try:
+            decision = json.loads(block)
+        except json.JSONDecodeError:
+            invalid = True
+            continue
+        if not isinstance(decision, dict):
+            invalid = True
+            continue
+        invalid = _record_declared_decision(
+            home=home,
+            conn=conn,
+            run_id=run_id,
+            payload=decision,
+            source="stdout_marker",
+            allow_invalid=allow_invalid,
+        ) or invalid
+    return invalid
+
+
+def _build_declared_decision_payload(args: argparse.Namespace, base_payload: dict[str, object]) -> dict[str, object]:
+    if not any([args.step_id, args.decision_type, args.input_refs, args.output_json, args.output_file, args.evidence_json, args.candidate]):
+        return base_payload
+
+    payload = dict(base_payload)
+    if args.step_id:
+        payload["step_id"] = args.step_id
+    if args.decision_type:
+        payload["decision_type"] = args.decision_type
+    if args.input_refs:
+        payload["input_refs"] = args.input_refs
+    if args.input_fingerprint:
+        payload["input_fingerprint"] = args.input_fingerprint
+    if args.output_json:
+        payload["output"] = _load_json_payload(args.output_json)
+    if args.output_file:
+        output_payload = json.loads(Path(args.output_file).read_text(encoding="utf-8"))
+        if not isinstance(output_payload, dict):
+            raise SystemExit("--output-file must contain a JSON object")
+        payload["output"] = output_payload
+    if args.evidence_json:
+        evidence = json.loads(args.evidence_json)
+        if not isinstance(evidence, list):
+            raise SystemExit("--evidence-json must contain a JSON array")
+        payload["evidence"] = evidence
+    if args.candidate is not None:
+        payload["compilation_candidate"] = args.candidate == "true"
+    return payload
+
+
+def cmd_decision_record(args: argparse.Namespace) -> int:
+    home = resolve_home()
+    conn = ensure_schema(home)
+    run_id = _resolve_run_id(args.run_id)
+    payload = _build_declared_decision_payload(args, _load_json_payload(args.data_json))
+    decision_validity = _validate_declared_decision(payload) if "step_id" in payload else "valid"
+    compilation_candidate = _to_bool(payload.get("compilation_candidate")) is True
+    decision_key = args.decision_key or (str(payload["step_id"]) if isinstance(payload.get("step_id"), str) else None)
+    decision_id = record_decision(
+        conn=conn,
+        run_id=run_id,
+        decision_key=decision_key,
+        payload=payload,
+        decision_source=args.decision_source,
+        decision_validity=decision_validity,
+        compilation_candidate=compilation_candidate,
+    )
+    append_trace(
+        home,
+        run_id,
+        "decision_recorded",
+        {
+            "decision_id": decision_id,
+            "decision_key": decision_key,
+            "decision_source": args.decision_source,
+            "decision_validity": decision_validity,
+            "compilation_candidate": compilation_candidate,
+        },
     )
     print(
         json.dumps(
-            {"decision_id": decision_id, "run_id": run_id, "decision_key": args.decision_key},
+            {
+                "decision_id": decision_id,
+                "run_id": run_id,
+                "decision_key": decision_key,
+                "decision_source": args.decision_source,
+                "decision_validity": decision_validity,
+                "compilation_candidate": compilation_candidate,
+            },
             ensure_ascii=False,
         )
     )
@@ -312,6 +549,9 @@ def cmd_decision_list(args: argparse.Namespace) -> int:
                     "run_id": row["run_id"],
                     "ts": row["ts"],
                     "decision_key": row["decision_key"],
+                    "decision_source": row["decision_source"],
+                    "decision_validity": row["decision_validity"],
+                    "compilation_candidate": bool(row["compilation_candidate"]),
                     "payload_json": json.loads(row["payload_json"]),
                 },
                 ensure_ascii=False,
@@ -334,6 +574,9 @@ def cmd_decision_show(args: argparse.Namespace) -> int:
                 "run_id": row["run_id"],
                 "ts": row["ts"],
                 "decision_key": row["decision_key"],
+                "decision_source": row["decision_source"],
+                "decision_validity": row["decision_validity"],
+                "compilation_candidate": bool(row["compilation_candidate"]),
                 "payload_json": json.loads(row["payload_json"]),
             },
             ensure_ascii=False,

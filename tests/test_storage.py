@@ -79,7 +79,15 @@ class StorageTestCase(unittest.TestCase):
             ),
         )
         record_event(self.conn, "run_evt", "env_snapshot", {"safe": True})
-        decision_id = record_decision(self.conn, "run_evt", "route", {"chosen": "retry"})
+        decision_id = record_decision(
+            self.conn,
+            "run_evt",
+            "route",
+            {"chosen": "retry"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
         outcome_id = record_outcome(self.conn, "run_evt", "success", {"result": "green"})
 
         decision = get_decision(self.conn, decision_id)
@@ -136,11 +144,52 @@ class StorageTestCase(unittest.TestCase):
                 trace_path="trace",
             ),
         )
-        record_decision(self.conn, "run_patterns", "route.fix_ci", {"chosen": "retry"})
-        record_decision(self.conn, "run_patterns", "route.fix_ci", {"chosen": "retry"})
-        record_decision(self.conn, "run_patterns", "route.fix_ci", {"chosen": "escalate"})
-        record_decision(self.conn, "run_patterns", "route.docs", {"chosen": "delegate"})
-        record_decision(self.conn, "run_patterns", "route.docs", {"chosen": "delegate"})
+        record_decision(
+            self.conn,
+            "run_patterns",
+            "route.fix_ci",
+            {"chosen": "retry"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_patterns",
+            "route.fix_ci",
+            {"chosen": "retry"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_patterns",
+            "route.fix_ci",
+            {"chosen": "escalate"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_patterns",
+            "route.docs",
+            {"chosen": "delegate"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_patterns",
+            "route.docs",
+            {"chosen": "delegate"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_outcome(self.conn, "run_patterns", "success", {"result": "green"})
 
         rows = list_decision_patterns(self.conn, min_support=2, limit=10)
         self.assertEqual(len(rows), 2)
@@ -171,10 +220,43 @@ class StorageTestCase(unittest.TestCase):
                 trace_path="trace",
             ),
         )
-        record_decision(self.conn, "run_choices", "route.fix_ci", {"chosen": "retry"})
-        record_decision(self.conn, "run_choices", "route.fix_ci", {"note": "missing chosen"})
-        record_decision(self.conn, "run_choices", "route.fix_ci", {"chosen": "escalate"})
-        record_decision(self.conn, "run_choices", "route.docs", {"chosen": "delegate"})
+        record_decision(
+            self.conn,
+            "run_choices",
+            "route.fix_ci",
+            {"chosen": "retry"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_choices",
+            "route.fix_ci",
+            {"note": "missing chosen"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_choices",
+            "route.fix_ci",
+            {"chosen": "escalate"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_decision(
+            self.conn,
+            "run_choices",
+            "route.docs",
+            {"chosen": "delegate"},
+            decision_source="cli_record",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+        record_outcome(self.conn, "run_choices", "success", {"result": "green"})
 
         choices = list_decision_choices(self.conn, decision_key="route.fix_ci")
         self.assertEqual(choices, ["retry", "escalate"])

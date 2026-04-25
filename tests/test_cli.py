@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 
 from agentos.cli import _load_json_payload, _resolve_run_id, main, parse_args
@@ -138,6 +139,8 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.fix_ci",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"retry"}',
             ]
@@ -201,6 +204,8 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.fix_ci",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"retry"}',
             ]
@@ -213,6 +218,8 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.fix_ci",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"retry"}',
             ]
@@ -225,6 +232,8 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.fix_ci",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"escalate"}',
             ]
@@ -237,6 +246,8 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.docs",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"delegate"}',
             ]
@@ -249,8 +260,22 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.docs",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"delegate"}',
+            ]
+        )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
             ]
         )
 
@@ -282,10 +307,24 @@ class CLITestCase(unittest.TestCase):
                     run_id,
                     "--key",
                     "route.fix_ci",
+                    "--candidate",
+                    "true",
                     "--data-json",
                     json.dumps({"chosen": chosen}),
                 ]
             )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
 
         code, out, _ = self._run_cli(
             [
@@ -326,8 +365,22 @@ class CLITestCase(unittest.TestCase):
                 run_id,
                 "--key",
                 "route.docs",
+                "--candidate",
+                "true",
                 "--data-json",
                 '{"chosen":"delegate"}',
+            ]
+        )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
             ]
         )
         code, out, _ = self._run_cli(["backtest", "run", "--decision-key", "route.docs"])
@@ -352,10 +405,24 @@ class CLITestCase(unittest.TestCase):
                     run_id,
                     "--key",
                     "route.fix_ci",
+                    "--candidate",
+                    "true",
                     "--data-json",
                     json.dumps({"chosen": chosen}),
                 ]
             )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "accepted",
+                "--data-json",
+                '{"result":"human_accepted"}',
+            ]
+        )
 
         code, out, _ = self._run_cli(
             [
@@ -404,10 +471,24 @@ class CLITestCase(unittest.TestCase):
                     run_id,
                     "--key",
                     "route.fix_ci",
+                    "--candidate",
+                    "true",
                     "--data-json",
                     json.dumps({"chosen": chosen}),
                 ]
             )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
 
         code, out, _ = self._run_cli(
             [
@@ -428,6 +509,91 @@ class CLITestCase(unittest.TestCase):
         self.assertFalse(payload["promoted"])
         self.assertEqual(payload["status"], "abstain")
         self.assertTrue(payload["fallback_enabled"])
+
+    def test_wrap_ingests_decision_file_and_outcome(self) -> None:
+        artifact_dir = Path(self.temp_dir.name) / "agentos-artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        decision_file = artifact_dir / "decisions.json"
+        decision_file.write_text(
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "step_id": "classify_failure",
+                            "decision_type": "llm",
+                            "input_refs": ["job-log.txt"],
+                            "output": {"failure_type": "eslint_unused_variable", "confidence": 0.94},
+                            "evidence": ["CI log contains no-unused-vars"],
+                            "compilation_candidate": True,
+                        }
+                    ],
+                    "outcome": {"status": "success", "tests_passed": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.decision.file",
+                "--decision-file",
+                str(decision_file),
+                "--",
+                "python",
+                "-c",
+                "print('ok')",
+            ]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        code, out, _ = self._run_cli(["decision", "list", "--limit", "5"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(rows[0]["run_id"], run_id)
+        self.assertEqual(rows[0]["decision_source"], "decision_file")
+        self.assertEqual(rows[0]["decision_validity"], "valid")
+        self.assertTrue(rows[0]["compilation_candidate"])
+
+    def test_wrap_strict_decisions_fails_on_invalid_decision_file(self) -> None:
+        artifact_dir = Path(self.temp_dir.name) / "agentos-artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        decision_file = artifact_dir / "decisions.json"
+        decision_file.write_text(
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "step_id": "classify_failure",
+                            "decision_type": "llm",
+                            "output": {"failure_type": "eslint_unused_variable", "confidence": 0.94},
+                            "evidence": ["CI log contains no-unused-vars"],
+                            "compilation_candidate": True,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.decision.strict",
+                "--decision-file",
+                str(decision_file),
+                "--strict-decisions",
+                "--",
+                "python",
+                "-c",
+                "print('ok')",
+            ]
+        )
+        self.assertEqual(code, 2)
+        payload = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(payload["decision_error"], "invalid_declared_decision")
 
 
 if __name__ == "__main__":
