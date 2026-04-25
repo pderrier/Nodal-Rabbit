@@ -26,6 +26,17 @@ class RunRecord:
     trace_path: str
 
 
+@dataclass
+class PromotedRuleRecord:
+    rule_id: str
+    decision_key: str
+    candidate_choice: str
+    status: str
+    fallback_enabled: bool
+    metrics_json: str
+    promoted_at: str
+
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -92,12 +103,29 @@ def ensure_schema(home: Path) -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promoted_rules (
+            rule_id TEXT PRIMARY KEY,
+            decision_key TEXT NOT NULL,
+            candidate_choice TEXT NOT NULL,
+            status TEXT NOT NULL,
+            fallback_enabled INTEGER NOT NULL,
+            metrics_json TEXT NOT NULL,
+            promoted_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
 
 def create_run_id(provided_run_id: str | None = None) -> str:
     return provided_run_id or f"run_{uuid.uuid4().hex[:12]}"
+
+
+def create_rule_id(provided_rule_id: str | None = None) -> str:
+    return provided_rule_id or f"rule_{uuid.uuid4().hex[:12]}"
 
 
 def trace_file(home: Path, run_id: str) -> Path:
@@ -195,6 +223,80 @@ def list_decisions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Ro
     return list(cursor.fetchall())
 
 
+def list_decision_patterns(
+    conn: sqlite3.Connection,
+    min_support: int = 2,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        WITH decision_values AS (
+            SELECT
+                decision_key,
+                json_extract(payload_json, '$.chosen') AS chosen
+            FROM decisions
+            WHERE decision_key IS NOT NULL
+        ),
+        choice_counts AS (
+            SELECT
+                decision_key,
+                chosen,
+                COUNT(*) AS chosen_count
+            FROM decision_values
+            WHERE chosen IS NOT NULL
+            GROUP BY decision_key, chosen
+        ),
+        totals AS (
+            SELECT
+                decision_key,
+                SUM(chosen_count) AS support
+            FROM choice_counts
+            GROUP BY decision_key
+        ),
+        ranked AS (
+            SELECT
+                c.decision_key,
+                c.chosen,
+                c.chosen_count,
+                t.support,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.decision_key
+                    ORDER BY c.chosen_count DESC, c.chosen ASC
+                ) AS rn
+            FROM choice_counts c
+            JOIN totals t ON t.decision_key = c.decision_key
+            WHERE t.support >= ?
+        )
+        SELECT
+            decision_key,
+            chosen AS dominant_choice,
+            chosen_count AS dominant_count,
+            support,
+            ROUND(CAST(chosen_count AS REAL) / CAST(support AS REAL), 6) AS confidence
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY support DESC, confidence DESC, decision_key ASC
+        LIMIT ?
+        """,
+        (min_support, limit),
+    )
+    return list(cursor.fetchall())
+
+
+def list_decision_choices(conn: sqlite3.Connection, decision_key: str) -> list[str]:
+    cursor = conn.execute(
+        """
+        SELECT json_extract(payload_json, '$.chosen') AS chosen
+        FROM decisions
+        WHERE decision_key = ?
+        ORDER BY id ASC
+        """,
+        (decision_key,),
+    )
+    return [str(row[0]) for row in cursor.fetchall() if row[0] is not None]
+
+
 def get_decision(conn: sqlite3.Connection, decision_id: int) -> sqlite3.Row | None:
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
@@ -220,3 +322,37 @@ def record_outcome(
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def record_promoted_rule(conn: sqlite3.Connection, promoted_rule: PromotedRuleRecord) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO promoted_rules(
+            rule_id, decision_key, candidate_choice, status, fallback_enabled, metrics_json, promoted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            promoted_rule.rule_id,
+            promoted_rule.decision_key,
+            promoted_rule.candidate_choice,
+            promoted_rule.status,
+            int(promoted_rule.fallback_enabled),
+            promoted_rule.metrics_json,
+            promoted_rule.promoted_at,
+        ),
+    )
+    conn.commit()
+
+
+def list_promoted_rules(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        SELECT rule_id, decision_key, candidate_choice, status, fallback_enabled, metrics_json, promoted_at
+        FROM promoted_rules
+        ORDER BY promoted_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return list(cursor.fetchall())
