@@ -83,6 +83,154 @@ agentos wrap \
 AgentOS does not infer hidden model reasoning.
 It compiles only validated declared decisions with outcomes.
 
+## Concrete headless integration example (Claude Code + Codex CLI)
+
+This example shows a wrapper-first integration where you keep your existing headless flows and only add explicit decision declarations.
+
+### 1) Claude Code headless flow writes a decision file
+
+`run-claude-headless.sh` (existing worker script):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p agentos-artifacts
+
+# your existing headless invocation (placeholder)
+claude-code --headless --input ci_failure.txt --output claude_output.json
+
+# explicit declared decision for AgentOS compilation (not inferred)
+cat > agentos-artifacts/decisions.json <<'JSON'
+{
+  "decisions": [
+    {
+      "step_id": "route.fix_ci",
+      "decision_type": "llm",
+      "input_refs": ["ci_failure.txt"],
+      "output": {"chosen": "retry", "confidence": 0.93},
+      "evidence": ["failure_signature:no-unused-vars"],
+      "compilation_candidate": true
+    }
+  ],
+  "outcome": {"status": "success", "pipeline": "green"}
+}
+JSON
+```
+
+Wrap it with AgentOS:
+
+```bash
+python -m agentos wrap \
+  --intent ci.fix_with_claude \
+  --decision-file agentos-artifacts/decisions.json \
+  --strict-decisions \
+  -- ./run-claude-headless.sh
+```
+
+`--strict-decisions` ensures malformed declarations fail fast instead of silently becoming trusted compilation input.
+
+### 2) Codex CLI headless flow emits stdout decision markers
+
+`run-codex-headless.sh` (existing worker script):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# your existing headless invocation (placeholder)
+codex exec --task "fix failing CI"
+
+# explicit declared decision marker for AgentOS ingestion
+cat <<'MARKER'
+===AGENTOS_DECISION_START===
+{"step_id":"route.fix_ci","decision_type":"llm","input_refs":["ci_failure.txt"],"output":{"chosen":"retry","confidence":0.91},"evidence":["matched known flaky test pattern"],"compilation_candidate":true}
+===AGENTOS_DECISION_END===
+MARKER
+```
+
+Wrap it with AgentOS:
+
+```bash
+python -m agentos wrap \
+  --intent ci.fix_with_codex \
+  --parse-decision-markers \
+  --strict-decisions \
+  -- ./run-codex-headless.sh
+```
+
+If you do **not** want to modify model prompts, use a tiny adapter that converts existing tool output into a declaration file:
+
+```bash
+# adapter sketch (inside your existing script)
+python extract_decision.py --from codex_output.json --to agentos-artifacts/decisions.json
+python -m agentos wrap --intent ci.fix_with_codex --decision-file agentos-artifacts/decisions.json --strict-decisions -- ./run-codex-headless.sh
+```
+
+### 3) Do we need to modify headless prompts/scripts?
+
+Short answer: **yes, minimally**—if you want trusted compilation candidates.
+
+- AgentOS can capture full run traces/logs for debugging.
+- But MVP intentionally does **not** trust passive log inference as a declared LLM decision.
+- For compilation, the worker must emit an explicit declaration (decision file, stdout marker, CLI/SDK instrumentation).
+
+Why: a free-form log line like `"I think retry might work"` is ambiguous and can be misread. MVP requires explicit structure to avoid guessing hidden reasoning.
+
+Practical options:
+
+1. **Prompt contract in headless mode** (ask Claude/Codex to emit one strict JSON object or marker block).
+2. **Adapter script** (keep prompt unchanged, parse your tool output, then write `agentos-artifacts/decisions.json`).
+3. **Direct instrumentation** (`agentos decision record ...`) from your existing script after each operational decision.
+
+#### Prompt adaptation example (headless CLI task)
+
+If your existing headless prompt is `"Fix the CI failure"`, adapt it to include a strict decision declaration contract:
+
+```text
+Task: Fix the CI failure.
+
+After producing your normal output, you MUST emit exactly one AgentOS decision marker block:
+===AGENTOS_DECISION_START===
+{"step_id":"route.fix_ci","decision_type":"llm","input_refs":["ci_failure.txt"],"output":{"chosen":"retry|escalate|rollback","confidence":0.0},"evidence":["short evidence item"],"compilation_candidate":true}
+===AGENTOS_DECISION_END===
+
+Rules:
+- output valid JSON (single object)
+- confidence in [0,1]
+- include at least one input reference
+- do not include extra text inside the marker block
+```
+
+Minimal Claude Code headless shape:
+
+```bash
+claude-code --headless --prompt-file prompts/fix_ci_with_agentos_contract.txt
+```
+
+Minimal Codex CLI headless shape:
+
+```bash
+codex exec --task-file prompts/fix_ci_with_agentos_contract.txt
+```
+
+This preserves wrapper-first adoption: you keep the same worker and just tighten the output contract so AgentOS captures declared decisions safely.
+
+### 4) Verification commands (prove decisions were declared, not guessed)
+
+```bash
+python -m agentos decision list --limit 20
+python -m agentos runs trace <run_id>
+```
+
+For trusted compilation candidates in MVP, verify:
+
+- `decision_source` is one of: `decision_file`, `stdout_marker`, `cli_record`, `sdk_record`.
+- `decision_validity` is `valid`.
+- `compilation_candidate` is `true`.
+- an associated outcome is recorded for the run.
+
+If a decision is only visible in passive logs and was never declared through one of the explicit channels above, treat it as debug-only and do not compile it.
+
 ## Repository contents
 
 - `agentos_mvp_v0_3.md` — canonical MVP product/technical specification.

@@ -1005,6 +1005,78 @@ class CLITestCase(unittest.TestCase):
         payload = json.loads(out.strip().splitlines()[-1])
         self.assertEqual(payload["decision_error"], "invalid_declared_decision")
 
+    def test_wrap_ingests_stdout_decision_markers(self) -> None:
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.stdout.markers",
+                "--parse-decision-markers",
+                "--",
+                "python",
+                "-c",
+                (
+                    "print(\"===AGENTOS_DECISION_START===\")\n"
+                    "print(\"{\\\"step_id\\\":\\\"route.fix_ci\\\",\\\"decision_type\\\":\\\"llm\\\",\\\"input_refs\\\":[\\\"ci_failure.txt\\\"],\\\"output\\\":{\\\"chosen\\\":\\\"retry\\\",\\\"confidence\\\":0.9},\\\"evidence\\\":[\\\"signature:flake\\\"],\\\"compilation_candidate\\\":true}\")\n"
+                    "print(\"===AGENTOS_DECISION_END===\")"
+                ),
+            ]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        code, out, _ = self._run_cli(["decision", "list", "--limit", "5"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(rows[0]["run_id"], run_id)
+        self.assertEqual(rows[0]["decision_source"], "stdout_marker")
+        self.assertEqual(rows[0]["decision_validity"], "valid")
+        self.assertTrue(rows[0]["compilation_candidate"])
+
+    def test_wrap_parse_decision_markers_ignores_plain_logs_without_markers(self) -> None:
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.stdout.no.markers",
+                "--parse-decision-markers",
+                "--strict-decisions",
+                "--",
+                "python",
+                "-c",
+                'print("I think retry might work")',
+            ]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        code, out, _ = self._run_cli(["decision", "list", "--limit", "20"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertFalse(any(row["run_id"] == run_id for row in rows))
+
+    def test_wrap_strict_decisions_fails_on_invalid_stdout_marker(self) -> None:
+        code, out, _ = self._run_cli(
+            [
+                "wrap",
+                "--intent",
+                "demo.stdout.markers.strict",
+                "--parse-decision-markers",
+                "--strict-decisions",
+                "--",
+                "python",
+                "-c",
+                (
+                    "print(\"===AGENTOS_DECISION_START===\")\n"
+                    "print(\"{\\\"step_id\\\":\\\"route.fix_ci\\\",\\\"decision_type\\\":\\\"llm\\\",\\\"output\\\":{\\\"chosen\\\":\\\"retry\\\"},\\\"evidence\\\":[],\\\"compilation_candidate\\\":true}\")\n"
+                    "print(\"===AGENTOS_DECISION_END===\")"
+                ),
+            ]
+        )
+        self.assertEqual(code, 2)
+        payload = json.loads(out.strip().splitlines()[-1])
+        self.assertEqual(payload["decision_error"], "invalid_declared_decision")
+
     def test_release_checklist_reports_gates_and_strict_failure_when_artifacts_missing(self) -> None:
         cwd = os.getcwd()
         os.chdir(self.temp_dir.name)
