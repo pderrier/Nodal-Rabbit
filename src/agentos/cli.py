@@ -1059,6 +1059,8 @@ def cmd_release_checklist(args: argparse.Namespace) -> int:
     release_artifacts = (
         ("vertical_slice_doc", "VERTICAL_SLICE_MVP_RELEASE.md"),
         ("release_checklist_doc", "RELEASE_MVP_CHECKLIST.md"),
+        ("mvp_spec_doc", "agentos_mvp_v0_3.md"),
+        ("roadmap_doc", "BACKLOG_MVP_PRIORISE_ROADMAP_6_SEMAINES.md"),
     )
     for gate_id, filename in release_artifacts:
         exists = (cwd / filename).exists()
@@ -1071,6 +1073,31 @@ def cmd_release_checklist(args: argparse.Namespace) -> int:
                 "details": {"path": str((cwd / filename).as_posix()), "exists": exists},
             }
         )
+
+    readme_path = cwd / "README.md"
+    readme_exists = readme_path.exists()
+    readme_raw = readme_path.read_text(encoding="utf-8") if readme_exists else ""
+    readme_expectations = {
+        "agentos_mvp_v0_3.md": "canonical MVP spec referenced",
+        "BACKLOG_MVP_PRIORISE_ROADMAP_6_SEMAINES.md": "roadmap referenced",
+        "VERTICAL_SLICE_MVP_RELEASE.md": "vertical slice referenced",
+        "RELEASE_MVP_CHECKLIST.md": "release checklist referenced",
+        "python -m agentos release checklist": "release checklist command referenced",
+    }
+    missing_expectations = [item for item in readme_expectations if item not in readme_raw]
+    gates.append(
+        {
+            "gate_id": "readme_release_references",
+            "description": "README references MVP spec, roadmap, release artifacts, and executable release checklist command",
+            "status": "pass" if readme_exists and not missing_expectations else "fail",
+            "checked_at": now,
+            "details": {
+                "readme_path": str(readme_path.as_posix()),
+                "readme_exists": readme_exists,
+                "missing_items": missing_expectations,
+            },
+        }
+    )
 
     runs_count = _count("SELECT COUNT(*) FROM runs")
     decisions_count = _count("SELECT COUNT(*) FROM decisions")

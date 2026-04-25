@@ -12,35 +12,35 @@ Scope: MVP v0 release readiness
 
 ## 2) Product/technical invariants (anti-drift)
 
-- [ ] One-command wrapper adoption for existing scripts/jobs is preserved.
-- [ ] Codex/Claude/scripts are wrapped, not replaced.
-- [ ] No orchestration platform behavior introduced before proving compile loop value.
-- [ ] Fallback remains enabled by default.
-- [ ] Every promoted rule abstains safely when uncertain.
-- [ ] No unimplemented sandbox/security claims appear in docs/runtime.
-- [ ] No heavy framework integration added before wrapper-first success.
-- [ ] AgentOS is not turned into a chatbot/personal assistant.
-- [ ] Core loop is preserved exactly.
+- [x] One-command wrapper adoption for existing scripts/jobs is preserved.
+- [x] Codex/Claude/scripts are wrapped, not replaced.
+- [x] No orchestration platform behavior introduced before proving compile loop value.
+- [x] Fallback remains enabled by default.
+- [x] Every promoted rule abstains safely when uncertain.
+- [x] No unimplemented sandbox/security claims appear in docs/runtime.
+- [x] No heavy framework integration added before wrapper-first success.
+- [x] AgentOS is not turned into a chatbot/personal assistant.
+- [x] Core loop is preserved exactly.
 
 ## 3) Test and quality gates
 
-- [ ] Unit + CLI integration tests pass locally.
-- [ ] Coverage on touched modules remains high (target >=85%).
-- [ ] End-to-end compile/promote/rule-first behavior is exercised by automated tests.
+- [x] Unit + CLI integration tests pass locally.
+- [x] Coverage on touched modules remains high (target >=85%).
+- [x] End-to-end compile/promote/rule-first behavior is exercised by automated tests.
 - [x] Automated gate evaluation is implemented in CLI (`release checklist`).
 
 ## 4) Runtime and data model checks
 
-- [ ] SQLite schema is initialized automatically on first run.
-- [ ] JSONL traces are written per run under `.agentos/runs/<run_id>/trace.jsonl`.
-- [ ] Decisions/outcomes are queryable and linked to runs.
-- [ ] Promoted/rejected rules persist evidence snapshots.
+- [x] SQLite schema is initialized automatically on first run.
+- [x] JSONL traces are written per run under `.agentos/runs/<run_id>/trace.jsonl`.
+- [x] Decisions/outcomes are queryable and linked to runs.
+- [x] Promoted/rejected rules persist evidence snapshots.
 
 ## 5) Release sign-off
 
-- [ ] MVP demonstrable in local + CI contexts.
-- [ ] README reflects implemented commands and release docs.
-- [ ] All open release blockers resolved or explicitly documented.
+- [x] MVP demonstrable in local + CI contexts.
+- [x] README reflects implemented commands and release docs.
+- [x] All open release blockers resolved or explicitly documented.
 
 ## Automated checklist behavior
 
@@ -49,6 +49,7 @@ Scope: MVP v0 release readiness
 - release artifacts exist in repository root;
 - runs include persisted trace path metadata;
 - stored rules preserve fallback policy;
-- minimum local evidence records (runs/decisions/outcomes) are present.
+- minimum local evidence records (runs/decisions/outcomes) are present;
+- README references implemented commands and release docs.
 
 Use `--strict` to fail CI when any automatic gate returns `fail`.
