@@ -70,9 +70,30 @@ Suggested first steps:
 3. Align implementation work with MVP scope and anti-drift constraints.
 4. Read `POSITIONING.md` for positioning details and prior-art boundaries.
 
+
+## Implementation status (as of 2026-04-25)
+
+A first MVP bootstrap is now available in this repository:
+
+- Python CLI scaffold (`agentos`).
+- `agentos wrap --intent ... -- <command>` to execute existing scripts without rewrite.
+- Local persistence with SQLite + JSONL traces under `.agentos/`.
+- Basic inspection commands: `agentos runs list`, `agentos runs show`, `agentos runs trace`.
+- Instrumentation commands: `agentos decision record|list|show` and `agentos outcome record`.
+
+Quick local run:
+
+```bash
+python -m agentos wrap --intent demo.echo -- echo "hello"
+python -m agentos decision record --run-id <run_id> --key route.fix_ci --data-json '{"chosen":"retry"}'
+python -m agentos outcome record --run-id <run_id> --status success --data-json '{"ci_pipeline":"green"}'
+python -m agentos runs list
+```
+
 ## Contributing
 
 Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening issues or pull requests.
+For future implementations, automated tests are mandatory and coverage should stay high (target: >= 85% on touched modules).
 
 ## License
 

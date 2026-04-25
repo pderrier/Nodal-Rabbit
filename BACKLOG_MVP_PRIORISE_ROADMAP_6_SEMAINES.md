@@ -10,6 +10,23 @@ Ce document est la roadmap d’exécution de la spec canonique `agentos_mvp_v0_3
 
 ---
 
+
+## 0) Suivi d'avancement (mis à jour le 2026-04-25)
+
+### État global
+- **Semaine active:** Semaine 1 (Wrap + traces).
+- **Progression estimée MVP:** ~25% (wrapper + persistance + instrumentation initiale).
+- **Bloquant actuel:** aucun bloquant technique majeur; prochaines étapes = candidates/backtest + config `agentos.yaml`.
+
+### Journal d'avancement
+- ✅ Initialisation d'une CLI Python `agentos` (commande `wrap`).
+- ✅ Persistance locale SQLite (`runs`, `events`, `decisions`, `outcomes`) + traces JSONL par run.
+- ✅ Inspection opérable de base (`runs list`, `runs show`, `runs trace`).
+- ✅ Redaction minimale des variables d'environnement sensibles (`TOKEN/SECRET/PASSWORD/KEY`) dans les événements.
+- ✅ Commandes d'instrumentation `decision record|list|show` et `outcome record` implémentées.
+- ✅ Suite de tests automatisés ajoutée (CLI + stockage) pour maintenir un coverage élevé sur les modules MVP.
+- ⏳ À faire immédiatement: détection de candidats (`compile candidates`) et backtest (`compile backtest`) avec métriques.
+
 ## 1) Backlog priorisé (non redondant avec la spec)
 
 ## P0 — Must-have MVP (wrapper-first + preuves)

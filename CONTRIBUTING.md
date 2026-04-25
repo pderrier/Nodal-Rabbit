@@ -45,6 +45,15 @@ Please avoid contributions that move AgentOS into areas explicitly excluded in M
 - [ ] Fallback semantics are preserved.
 - [ ] Documentation is updated where relevant.
 - [ ] Tests/checks were run (or limitations are documented).
+- [ ] New behavior is covered by automated tests.
+- [ ] Test coverage remains high (target: **>= 85%** on touched modules).
+
+## Test and coverage policy (mandatory for future implementations)
+
+- Every future implementation PR must include or update automated tests.
+- Changes without tests are considered incomplete unless a clear technical blocker is documented.
+- Contributors should run coverage locally and keep coverage high, with a default target of **>= 85%** on touched modules.
+- If coverage drops, the PR must explain why and include a remediation plan.
 
 ## Code and commit quality
 
