@@ -572,6 +572,47 @@ class CLITestCase(unittest.TestCase):
             self.assertGreaterEqual(r["coverage"], 10)
             self.assertIsInstance(r["predicate"], list)
 
+    def test_rules_promote_extracted_round_trip_to_runtime_check(self) -> None:
+        """End-to-end Phase D: promote a feature rule via CLI, runtime SDK matches it."""
+        from agentos.runtime import check_rule
+
+        code, out, _ = self._run_cli([
+            "rules", "promote-extracted",
+            "--decision-key", "teams.classify_thread",
+            "--predicate-json",
+            '[{"feature":"is_root","op":"==","value":true},'
+            '{"feature":"has_mention","op":"==","value":true}]',
+            "--chosen", "feedback",
+            "--metrics-json", '{"coverage":47,"precision":1.0}',
+        ])
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual(result["chosen"], "feedback")
+        self.assertEqual(result["status"], "promoted")
+        self.assertTrue(result["fallback_enabled"])
+
+        # Now the runtime SDK must find this rule.
+        match = check_rule(
+            "teams.classify_thread",
+            {"is_root": True, "has_mention": True},
+            agentos_home=os.environ["AGENTOS_HOME"],
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match["chosen"], "feedback")
+        self.assertEqual(match["rule_id"], result["rule_id"])
+
+    def test_rules_promote_extracted_rejects_invalid_predicate(self) -> None:
+        # Not a JSON array → exit 1.
+        code, _, err = self._run_cli([
+            "rules", "promote-extracted",
+            "--decision-key", "k",
+            "--predicate-json", '{"not":"a list"}',
+            "--chosen", "x",
+        ])
+        self.assertEqual(code, 1)
+        self.assertIn("must be a JSON array", err)
+
     def test_backtest_run_outputs_walk_forward_metrics(self) -> None:
         code, out, _ = self._run_cli(
             ["wrap", "--intent", "demo.backtest", "--", "python", "-c", "print('ok')"]

@@ -25,11 +25,13 @@ from .storage import (
     list_decision_patterns,
     list_decision_patterns_by_features,
     list_decisions,
+    list_promoted_feature_rules,
     list_promoted_rules,
     list_runs,
     record_decision,
     record_event,
     record_outcome,
+    record_promoted_feature_rule,
     record_promoted_rule,
     record_run,
     resolve_home,
@@ -230,6 +232,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rules_extract.add_argument(
         "--max-depth", type=int, default=4,
         help="Maximum predicate-conjunction length (default: 4)",
+    )
+
+    rules_promote_extracted = rules_sub.add_parser(
+        "promote-extracted",
+        help="Promote a feature-conditioned rule (proposal from `rules extract`) to the rule store. "
+             "Stored alongside key-only promoted rules — distinguished by the predicate_json column.",
+    )
+    rules_promote_extracted.add_argument("--decision-key", required=True)
+    rules_promote_extracted.add_argument(
+        "--predicate-json", required=True,
+        help='JSON array of {feature, op, value} clauses, e.g. \'[{"feature":"is_root","op":"==","value":true}]\'',
+    )
+    rules_promote_extracted.add_argument("--chosen", required=True, help="Choice this rule promotes")
+    rules_promote_extracted.add_argument(
+        "--metrics-json", default='{}',
+        help="JSON object of provenance metrics (coverage, precision, support_total, ...)",
+    )
+    rules_promote_extracted.add_argument(
+        "--rule-id",
+        help="Optional explicit rule_id (default: auto-generated)",
+    )
+    rules_promote_extracted.add_argument(
+        "--no-fallback", action="store_true",
+        help="Disable fallback for this rule (CAUTION: removes safety net)",
     )
 
     release = sub.add_parser("release", help="Release readiness utilities")
@@ -1100,6 +1126,49 @@ def cmd_rules_reject(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rules_promote_extracted(args: argparse.Namespace) -> int:
+    """Promote a feature-conditioned rule produced by ``rules extract``."""
+    home = resolve_home()
+    conn = ensure_schema(home)
+
+    try:
+        predicate = json.loads(args.predicate_json)
+    except json.JSONDecodeError as exc:
+        print(f"--predicate-json: invalid JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(predicate, list):
+        print("--predicate-json must be a JSON array", file=sys.stderr)
+        return 1
+    try:
+        metrics = json.loads(args.metrics_json)
+    except json.JSONDecodeError as exc:
+        print(f"--metrics-json: invalid JSON: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(metrics, dict):
+        print("--metrics-json must be a JSON object", file=sys.stderr)
+        return 1
+
+    rule_id = args.rule_id or create_rule_id()
+    record_promoted_feature_rule(
+        conn,
+        rule_id=rule_id,
+        decision_key=args.decision_key,
+        predicate=predicate,
+        chosen=args.chosen,
+        metrics=metrics,
+        fallback_enabled=not args.no_fallback,
+    )
+    print(json.dumps({
+        "rule_id": rule_id,
+        "decision_key": args.decision_key,
+        "chosen": args.chosen,
+        "predicate": predicate,
+        "fallback_enabled": not args.no_fallback,
+        "status": "promoted",
+    }, ensure_ascii=False))
+    return 0
+
+
 def cmd_rules_extract(args: argparse.Namespace) -> int:
     """Mine rule proposals from feature-conditioned decisions.
 
@@ -1299,6 +1368,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rules_list(args)
         if args.rules_command == "extract":
             return cmd_rules_extract(args)
+        if args.rules_command == "promote-extracted":
+            return cmd_rules_promote_extracted(args)
     if args.command == "release":
         if args.release_command == "checklist":
             return cmd_release_checklist(args)

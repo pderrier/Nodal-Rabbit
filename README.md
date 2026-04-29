@@ -174,7 +174,46 @@ Output shape (one JSON object per line):
 }
 ```
 
-Rules are *proposals*, not promotions. Promotion to the rule store stays an explicit, human-reviewed step (`agentos rules promote`). The extractor is intentionally pure-Python with no ML dependency — Gini impurity, greedy single-feature splits, and equality-only predicates keep proposals simple and reviewable.
+Rules are *proposals*, not promotions. Promotion to the rule store stays an explicit, human-reviewed step. The extractor is intentionally pure-Python with no ML dependency — Gini impurity, greedy single-feature splits, and equality-only predicates keep proposals simple and reviewable.
+
+### Promoting an extracted rule
+
+After reviewing the proposal, persist it with:
+
+```bash
+agentos rules promote-extracted \
+  --decision-key teams.classify_thread \
+  --predicate-json '[{"feature":"is_root","op":"==","value":true},
+                     {"feature":"has_mention","op":"==","value":true}]' \
+  --chosen feedback \
+  --metrics-json '{"coverage":47,"precision":1.0,"support_total":200}'
+```
+
+Promoted feature-rules live in the same `promoted_rules` table as key-only rules — they are distinguished by the `predicate_json` column.
+
+### Runtime: `check_rule()` SDK
+
+Wrapped workers consume promoted rules via the runtime SDK *before* invoking their LLM/agent — if a rule matches, the worker returns the deterministic answer and skips the model call entirely:
+
+```python
+from agentos.runtime import check_rule
+
+decision = check_rule("teams.classify_thread", {
+    "is_root": True,
+    "has_mention": True,
+    "sender_is_devops": True,
+})
+if decision is not None:
+    # Rule fired — skip the LLM, use the deterministic answer.
+    return decision["chosen"]  # → "feedback"
+
+# No rule matched — fall through to the model.
+return llm_classify(...)
+```
+
+Returns `None` when no rule matches — the caller decides what fallback to invoke (LLM, manual flow, etc.). The most specific rule (longest predicate) wins ties, mirroring how a decision tree's deeper leaves carry more discriminating information.
+
+This is the loop's payoff: when a feature combination has been observed enough times with a single deterministic outcome, the LLM call is replaced by a `dict` lookup. Cost drops, latency drops, accuracy rises (no model variance), and the fallback path is preserved by default.
 
 ## Concrete headless integration example (Claude Code + Codex CLI)
 
