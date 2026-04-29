@@ -15,6 +15,7 @@ from agentos.storage import (
     list_decision_choices,
     list_decisions,
     list_decision_patterns,
+    list_decision_patterns_by_features,
     list_promoted_rules,
     list_runs,
     record_decision,
@@ -282,6 +283,122 @@ class StorageTestCase(unittest.TestCase):
         self.assertEqual(rows[0]["candidate_choice"], "retry")
         self.assertEqual(rows[0]["status"], "promoted")
         self.assertEqual(rows[0]["fallback_enabled"], 1)
+
+    def _seed_run(self, run_id: str) -> None:
+        record_run(
+            self.conn,
+            RunRecord(
+                run_id=run_id,
+                intent="demo.features",
+                source="tests",
+                command="echo features",
+                started_at="2026-01-01T00:00:00.000Z",
+                finished_at="2026-01-01T00:00:00.010Z",
+                exit_code=0,
+                duration_ms=10,
+                trace_path="trace",
+            ),
+        )
+        record_outcome(self.conn, run_id, "success", {"result": "green"})
+
+    def _seed_decision(self, run_id: str, key: str, payload: dict) -> None:
+        record_decision(
+            self.conn,
+            run_id,
+            key,
+            payload,
+            decision_source="decision_file",
+            decision_validity="valid",
+            compilation_candidate=True,
+        )
+
+    def test_list_decision_patterns_by_features_groups_by_feature_signature(self) -> None:
+        # Two distinct feature buckets for the same decision_key — the miner
+        # must report each as a separate row with its own dominant choice.
+        for run_id in ("run_a", "run_b", "run_c"):
+            self._seed_run(run_id)
+        # Bucket 1: {is_root: true, has_mention: true} → always feedback
+        self._seed_decision("run_a", "teams.classify_thread", {
+            "chosen": "feedback",
+            "features": {"is_root": True, "has_mention": True},
+        })
+        self._seed_decision("run_a", "teams.classify_thread", {
+            "chosen": "feedback",
+            "features": {"is_root": True, "has_mention": True},
+        })
+        self._seed_decision("run_b", "teams.classify_thread", {
+            "chosen": "feedback",
+            "features": {"is_root": True, "has_mention": True},
+        })
+        # Bucket 2: {is_root: false, has_mention: false} → always skip
+        self._seed_decision("run_b", "teams.classify_thread", {
+            "chosen": "skip",
+            "features": {"is_root": False, "has_mention": False},
+        })
+        self._seed_decision("run_c", "teams.classify_thread", {
+            "chosen": "skip",
+            "features": {"is_root": False, "has_mention": False},
+        })
+
+        rows = list_decision_patterns_by_features(self.conn, min_support=2)
+        self.assertEqual(len(rows), 2)
+        by_choice = {r["dominant_choice"]: r for r in rows}
+        self.assertIn("feedback", by_choice)
+        self.assertIn("skip", by_choice)
+        self.assertEqual(by_choice["feedback"]["support"], 3)
+        self.assertEqual(by_choice["feedback"]["confidence"], 1.0)
+        self.assertEqual(by_choice["feedback"]["features"], {"is_root": True, "has_mention": True})
+        self.assertEqual(by_choice["skip"]["support"], 2)
+        self.assertEqual(by_choice["skip"]["confidence"], 1.0)
+
+    def test_list_decision_patterns_by_features_skips_decisions_without_features(self) -> None:
+        self._seed_run("run_x")
+        # No features field — should be skipped (handled by list_decision_patterns)
+        self._seed_decision("run_x", "route.fix_ci", {"chosen": "retry"})
+        self._seed_decision("run_x", "route.fix_ci", {"chosen": "retry"})
+        rows = list_decision_patterns_by_features(self.conn, min_support=2)
+        self.assertEqual(rows, [])
+
+    def test_list_decision_patterns_by_features_filters_by_decision_key(self) -> None:
+        self._seed_run("run_y")
+        self._seed_decision("run_y", "key.a", {"chosen": "x", "features": {"f": 1}})
+        self._seed_decision("run_y", "key.a", {"chosen": "x", "features": {"f": 1}})
+        self._seed_decision("run_y", "key.b", {"chosen": "y", "features": {"g": 2}})
+        self._seed_decision("run_y", "key.b", {"chosen": "y", "features": {"g": 2}})
+        rows = list_decision_patterns_by_features(self.conn, decision_key="key.a")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["decision_key"], "key.a")
+
+    def test_list_decision_patterns_by_features_canonicalizes_key_order(self) -> None:
+        # Two decisions with identical features but different key insertion
+        # order must end up in the same bucket.
+        self._seed_run("run_z")
+        self._seed_decision("run_z", "k", {"chosen": "ok", "features": {"a": 1, "b": 2}})
+        self._seed_decision("run_z", "k", {"chosen": "ok", "features": {"b": 2, "a": 1}})
+        rows = list_decision_patterns_by_features(self.conn, min_support=2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["support"], 2)
+
+    def test_list_decision_patterns_by_features_requires_confirmed_outcome(self) -> None:
+        # Decision with NO outcome must be excluded.
+        record_run(
+            self.conn,
+            RunRecord(
+                run_id="run_no_outcome",
+                intent="x",
+                source="t",
+                command="c",
+                started_at="2026-01-01T00:00:00.000Z",
+                finished_at="2026-01-01T00:00:00.010Z",
+                exit_code=0,
+                duration_ms=10,
+                trace_path="t",
+            ),
+        )
+        self._seed_decision("run_no_outcome", "k", {"chosen": "x", "features": {"f": 1}})
+        self._seed_decision("run_no_outcome", "k", {"chosen": "x", "features": {"f": 1}})
+        rows = list_decision_patterns_by_features(self.conn, min_support=2)
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

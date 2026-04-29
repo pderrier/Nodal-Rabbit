@@ -363,6 +363,168 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(by_key["route.docs"]["abstain_rate"], 0.0)
         self.assertTrue(by_key["route.docs"]["promote_ready"])
 
+    def test_decision_record_accepts_features_json(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.features", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        code, out, _ = self._run_cli(
+            [
+                "decision",
+                "record",
+                "--run-id",
+                run_id,
+                "--key",
+                "teams.classify_thread",
+                "--step",
+                "teams.classify_thread",
+                "--type",
+                "llm",
+                "--input-fingerprint",
+                "abc123",
+                "--output-json",
+                '{"chosen":"feedback","confidence":1.0}',
+                "--evidence-json",
+                "[]",
+                "--candidate",
+                "true",
+                "--features-json",
+                '{"is_root": true, "has_mention": true, "channel": "devops"}',
+            ]
+        )
+        self.assertEqual(code, 0)
+        decision_id = json.loads(out)["decision_id"]
+        self.assertEqual(json.loads(out)["decision_validity"], "valid")
+
+        code, show_out, _ = self._run_cli(["decision", "show", str(decision_id)])
+        self.assertEqual(code, 0)
+        decision_payload = json.loads(show_out)
+        # The features dict round-trips inside payload_json.
+        self.assertEqual(
+            decision_payload["payload_json"]["features"],
+            {"is_root": True, "has_mention": True, "channel": "devops"},
+        )
+
+    def test_decision_record_rejects_invalid_features_value_type(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.invalid_features", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        # Nested dict in features value — must fail validation.
+        code, out, _ = self._run_cli(
+            [
+                "decision",
+                "record",
+                "--run-id",
+                run_id,
+                "--key",
+                "k",
+                "--step",
+                "k",
+                "--type",
+                "llm",
+                "--input-fingerprint",
+                "fp",
+                "--output-json",
+                '{"chosen":"x"}',
+                "--evidence-json",
+                "[]",
+                "--candidate",
+                "true",
+                "--features-json",
+                '{"nested": {"oops": 1}}',
+            ]
+        )
+        self.assertEqual(code, 0)  # Stored but marked invalid by default
+        validity = json.loads(out)["decision_validity"]
+        self.assertEqual(validity, "invalid_schema")
+
+    def test_patterns_list_by_features_groups_by_feature_subspace(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.by_features", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        # Two distinct feature buckets, each unanimous on its choice.
+        for _ in range(3):
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "teams.classify_thread",
+                    "--step",
+                    "teams.classify_thread",
+                    "--type",
+                    "llm",
+                    "--input-fingerprint",
+                    "fp1",
+                    "--output-json",
+                    '{"chosen":"feedback"}',
+                    "--evidence-json",
+                    "[]",
+                    "--candidate",
+                    "true",
+                    "--features-json",
+                    '{"is_root": true, "has_mention": true}',
+                ]
+            )
+        for _ in range(2):
+            self._run_cli(
+                [
+                    "decision",
+                    "record",
+                    "--run-id",
+                    run_id,
+                    "--key",
+                    "teams.classify_thread",
+                    "--step",
+                    "teams.classify_thread",
+                    "--type",
+                    "llm",
+                    "--input-fingerprint",
+                    "fp2",
+                    "--output-json",
+                    '{"chosen":"skip"}',
+                    "--evidence-json",
+                    "[]",
+                    "--candidate",
+                    "true",
+                    "--features-json",
+                    '{"is_root": false, "has_mention": false}',
+                ]
+            )
+        self._run_cli(
+            [
+                "outcome",
+                "record",
+                "--run-id",
+                run_id,
+                "--status",
+                "success",
+                "--data-json",
+                '{"result":"green"}',
+            ]
+        )
+
+        code, out, _ = self._run_cli(["patterns", "list", "--by-features", "--min-support", "2"])
+        self.assertEqual(code, 0)
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(len(rows), 2)
+        by_choice = {r["dominant_choice"]: r for r in rows}
+        self.assertEqual(by_choice["feedback"]["support"], 3)
+        self.assertEqual(by_choice["feedback"]["confidence"], 1.0)
+        self.assertTrue(by_choice["feedback"]["promote_ready"])
+        self.assertEqual(by_choice["feedback"]["features"], {"is_root": True, "has_mention": True})
+        self.assertEqual(by_choice["skip"]["support"], 2)
+
     def test_backtest_run_outputs_walk_forward_metrics(self) -> None:
         code, out, _ = self._run_cli(
             ["wrap", "--intent", "demo.backtest", "--", "python", "-c", "print('ok')"]

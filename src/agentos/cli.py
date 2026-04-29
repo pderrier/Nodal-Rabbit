@@ -23,6 +23,7 @@ from .storage import (
     get_run,
     list_decision_choices,
     list_decision_patterns,
+    list_decision_patterns_by_features,
     list_decisions,
     list_promoted_rules,
     list_runs,
@@ -99,6 +100,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     decision_record.add_argument("--output-json", default=None)
     decision_record.add_argument("--output-file", default=None)
     decision_record.add_argument("--evidence-json", default=None)
+    decision_record.add_argument(
+        "--features-json",
+        default=None,
+        help="JSON object of structured features (str/bool/int/float values) for rule mining",
+    )
     decision_record.add_argument("--candidate", choices=("true", "false"), default=None)
     decision_record.add_argument(
         "--data-json",
@@ -138,6 +144,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     patterns_list = patterns_sub.add_parser("list", help="List repeated decision patterns")
     patterns_list.add_argument("--min-support", type=int, default=2)
     patterns_list.add_argument("--limit", type=int, default=20)
+    patterns_list.add_argument(
+        "--by-features",
+        action="store_true",
+        help="Group decisions by (decision_key, features) — surfaces feature-conditioned patterns "
+             "for rule extraction. Decisions without a `features` field are skipped.",
+    )
+    patterns_list.add_argument(
+        "--decision-key",
+        default=None,
+        help="Optional filter: only mine patterns for this decision_key (used with --by-features)",
+    )
 
     compile_cmd = sub.add_parser(
         "compile",
@@ -554,6 +571,17 @@ def _validate_declared_decision(payload: dict[str, object]) -> str:
     evidence = payload.get("evidence")
     if evidence is not None and not isinstance(evidence, list):
         return "invalid_schema"
+    if "features" in payload:
+        features = payload.get("features")
+        if not isinstance(features, dict):
+            return "invalid_schema"
+        for k, v in features.items():
+            if not isinstance(k, str) or not k:
+                return "invalid_schema"
+            # Primitive feature values only — keep storage flat and SQL-mineable.
+            # Note: bool is a subclass of int in Python, both are accepted.
+            if not isinstance(v, (str, bool, int, float)):
+                return "invalid_schema"
     candidate = _to_bool(payload.get("compilation_candidate"))
     if candidate is None:
         return "invalid_schema"
@@ -665,7 +693,7 @@ def _ingest_stdout_markers(*, home: Path, conn, run_id: str, stdout: str, allow_
 
 
 def _build_declared_decision_payload(args: argparse.Namespace, base_payload: dict[str, object]) -> dict[str, object]:
-    if not any([args.step_id, args.decision_type, args.input_refs, args.output_json, args.output_file, args.evidence_json, args.candidate]):
+    if not any([args.step_id, args.decision_type, args.input_refs, args.output_json, args.output_file, args.evidence_json, args.features_json, args.candidate]):
         return base_payload
 
     payload = dict(base_payload)
@@ -689,6 +717,11 @@ def _build_declared_decision_payload(args: argparse.Namespace, base_payload: dic
         if not isinstance(evidence, list):
             raise SystemExit("--evidence-json must contain a JSON array")
         payload["evidence"] = evidence
+    if args.features_json:
+        features = json.loads(args.features_json)
+        if not isinstance(features, dict):
+            raise SystemExit("--features-json must contain a JSON object")
+        payload["features"] = features
     if args.candidate is not None:
         payload["compilation_candidate"] = args.candidate == "true"
     return payload
@@ -817,6 +850,32 @@ def cmd_outcome_record(args: argparse.Namespace) -> int:
 def cmd_patterns_list(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
+    by_features = getattr(args, "by_features", False)
+    if by_features:
+        rows = list_decision_patterns_by_features(
+            conn,
+            decision_key=getattr(args, "decision_key", None),
+            min_support=args.min_support,
+            limit=args.limit,
+        )
+        for row in rows:
+            confidence = float(row["confidence"])
+            print(
+                json.dumps(
+                    {
+                        "decision_key": row["decision_key"],
+                        "features": row["features"],
+                        "dominant_choice": row["dominant_choice"],
+                        "support": row["support"],
+                        "dominant_count": row["dominant_count"],
+                        "confidence": confidence,
+                        "abstain_rate": round(max(0.0, 1.0 - confidence), 6),
+                        "promote_ready": confidence == 1.0,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return 0
     rows = list_decision_patterns(conn, min_support=args.min_support, limit=args.limit)
     for row in rows:
         confidence = float(row["confidence"])
