@@ -138,7 +138,43 @@ agentos patterns list --by-features --min-support 30
 agentos patterns list --by-features --decision-key teams.classify_thread --min-support 30
 ```
 
-Feature-conditioned buckets with `confidence == 1.0` and high `support` are candidate deterministic rules — the input the rule extractor (planned) consumes to propose runtime short-circuits.
+Feature-conditioned buckets with `confidence == 1.0` and high `support` are candidate deterministic rules.
+
+### Decision-tree rule extraction
+
+`patterns list --by-features` reports *exact-match* feature buckets — useful when every feature is observed and bucketed identically across runs. For a more powerful mining loop that finds *subset* rules (e.g. *"the LLM picks `feedback` whenever `is_root=true` AND `has_mention=true`, regardless of other features"*), AgentOS ships a greedy decision-tree extractor:
+
+```bash
+agentos rules extract \
+  --decision-key teams.classify_thread \
+  --min-coverage 20 \
+  --min-precision 0.95 \
+  --max-depth 4
+```
+
+The extractor:
+1. Pulls all valid+candidate decisions for `--decision-key` with confirmed outcomes.
+2. Builds a greedy CART-like decision tree on the structured `features` field, splitting on the highest Gini-impurity reduction at each node.
+3. Walks high-precision leaves and emits one JSON-line rule proposal per qualifying leaf.
+
+Output shape (one JSON object per line):
+
+```json
+{
+  "decision_key": "teams.classify_thread",
+  "predicate": [
+    {"feature": "is_root", "op": "==", "value": true},
+    {"feature": "has_mention", "op": "==", "value": true}
+  ],
+  "chosen": "feedback",
+  "coverage": 47,
+  "precision": 1.0,
+  "support_total": 200,
+  "support_share": 0.235
+}
+```
+
+Rules are *proposals*, not promotions. Promotion to the rule store stays an explicit, human-reviewed step (`agentos rules promote`). The extractor is intentionally pure-Python with no ML dependency — Gini impurity, greedy single-feature splits, and equality-only predicates keep proposals simple and reviewable.
 
 ## Concrete headless integration example (Claude Code + Codex CLI)
 

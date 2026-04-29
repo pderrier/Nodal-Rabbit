@@ -213,6 +213,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rules_list = rules_sub.add_parser("list", help="List promoted rules")
     rules_list.add_argument("--limit", type=int, default=20)
 
+    rules_extract = rules_sub.add_parser(
+        "extract",
+        help="Mine deterministic rules from feature-conditioned decisions (decision-tree extractor). "
+             "Output is rule *proposals* — promotion to the rule store stays explicit.",
+    )
+    rules_extract.add_argument("--decision-key", required=True)
+    rules_extract.add_argument(
+        "--min-coverage", type=int, default=20,
+        help="Minimum samples a leaf must cover to qualify as a rule (default: 20)",
+    )
+    rules_extract.add_argument(
+        "--min-precision", type=float, default=0.95,
+        help="Minimum class purity at the leaf (1.0 = unanimous; default: 0.95)",
+    )
+    rules_extract.add_argument(
+        "--max-depth", type=int, default=4,
+        help="Maximum predicate-conjunction length (default: 4)",
+    )
+
     release = sub.add_parser("release", help="Release readiness utilities")
     release_sub = release.add_subparsers(dest="release_command", required=True)
 
@@ -1081,6 +1100,28 @@ def cmd_rules_reject(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rules_extract(args: argparse.Namespace) -> int:
+    """Mine rule proposals from feature-conditioned decisions.
+
+    Prints one JSON line per qualifying rule. Rules are *proposals* —
+    promotion to the rule store stays an explicit human-reviewed step.
+    """
+    from agentos.extractor import extract_rules_from_db
+
+    home = resolve_home()
+    conn = ensure_schema(home)
+    rules = extract_rules_from_db(
+        conn,
+        decision_key=args.decision_key,
+        min_coverage=args.min_coverage,
+        min_precision=args.min_precision,
+        max_depth=args.max_depth,
+    )
+    for rule in rules:
+        print(json.dumps(rule.to_dict(), ensure_ascii=False))
+    return 0
+
+
 def cmd_rules_list(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
@@ -1256,6 +1297,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rules_reject(args)
         if args.rules_command == "list":
             return cmd_rules_list(args)
+        if args.rules_command == "extract":
+            return cmd_rules_extract(args)
     if args.command == "release":
         if args.release_command == "checklist":
             return cmd_release_checklist(args)
