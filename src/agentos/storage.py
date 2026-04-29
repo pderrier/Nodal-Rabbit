@@ -5,7 +5,7 @@ import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ class PromotedRuleRecord:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def resolve_home(agentos_home: str | None = None) -> Path:

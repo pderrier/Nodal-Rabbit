@@ -196,6 +196,39 @@ class StorageContractTestCase(unittest.TestCase):
             self.assertIn(required, sig.parameters)
 
 
+class PythonVersionContractTestCase(unittest.TestCase):
+    """Lock the minimum Python version we promise to support.
+
+    pyproject.toml says ``requires-python = ">=3.10"`` — every public module
+    must therefore be importable on 3.10 too. Imports that depend on
+    later-version features (e.g. ``from datetime import UTC``, added in 3.11)
+    have caused silent test-skips for downstream consumers and must be
+    rejected.
+    """
+
+    def test_storage_imports_no_python_3_11_only_symbols(self) -> None:
+        # If you're tempted to add Python 3.11+ syntax/imports to storage.py,
+        # bump pyproject.toml's requires-python first AND coordinate with
+        # consumers (alert_brain runs on Python 3.10 in production).
+        src = (Path(__file__).parent.parent / "src" / "agentos" / "storage.py").read_text()
+        forbidden = [
+            ("from datetime import UTC", "3.11+ — use `datetime.timezone.utc` instead"),
+            ("from datetime import.*UTC", "3.11+ — use `datetime.timezone.utc` instead"),
+        ]
+        import re
+        for pattern, hint in forbidden:
+            self.assertFalse(
+                re.search(pattern, src),
+                f"agentos/storage.py contains a Python 3.11+ symbol "
+                f"({pattern}) but pyproject.toml claims 3.10 support. {hint}",
+            )
+
+    def test_pyproject_requires_python_matches_minimum_supported(self) -> None:
+        # Lock the declared minimum so tightening it is an explicit decision.
+        pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+        self.assertIn('requires-python = ">=3.10"', pyproject)
+
+
 class CLIContractTestCase(unittest.TestCase):
     """CLI commands consumers may invoke from wrapper scripts."""
 
