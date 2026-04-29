@@ -312,6 +312,116 @@ def list_decision_patterns(
     return list(cursor.fetchall())
 
 
+def list_decision_patterns_by_features(
+    conn: sqlite3.Connection,
+    *,
+    decision_key: str | None = None,
+    min_support: int = 2,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Mine patterns conditioned on the structured ``features`` field.
+
+    Buckets decisions by ``(decision_key, canonical_features)`` where
+    canonical_features is the sort-key-stable JSON of the ``features`` dict.
+    For each bucket, counts ``output.chosen`` values and returns the dominant
+    choice with support + confidence — same shape as
+    :func:`list_decision_patterns` but conditioned on feature subspaces.
+
+    This is the input AgentOS Phase C (rule extractor) consumes to propose
+    deterministic short-circuits: high-support, high-confidence buckets
+    are candidate rules.
+
+    Decisions without a ``features`` field are skipped (handled by
+    :func:`list_decision_patterns`).
+    """
+    conn.row_factory = sqlite3.Row
+    where_key = "AND decision_key = ?" if decision_key else ""
+    params: tuple = (decision_key,) if decision_key else ()
+    cursor = conn.execute(
+        f"""
+        SELECT
+            decision_key,
+            COALESCE(
+                json_extract(payload_json, '$.output.chosen'),
+                json_extract(payload_json, '$.chosen')
+            ) AS chosen,
+            json_extract(payload_json, '$.features') AS features_raw
+        FROM decisions
+        WHERE
+            decision_key IS NOT NULL
+            AND decision_source IN ('decision_file', 'stdout_marker', 'cli_record', 'sdk_record')
+            AND decision_validity = 'valid'
+            AND compilation_candidate = 1
+            {where_key}
+            AND EXISTS (
+                SELECT 1
+                FROM outcomes o
+                WHERE o.run_id = decisions.run_id
+                  AND o.status IN ('success', 'accepted')
+            )
+        """,
+        params,
+    )
+
+    # Bucket in Python — features are arbitrary JSON dicts, easier to
+    # canonicalize here than in SQLite.
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in cursor.fetchall():
+        chosen = row["chosen"]
+        features_raw = row["features_raw"]
+        if chosen is None or features_raw is None:
+            continue
+        try:
+            features = json.loads(features_raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(features, dict):
+            continue
+        canonical = json.dumps(features, sort_keys=True, ensure_ascii=False)
+        key = (str(row["decision_key"]), canonical)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "decision_key": str(row["decision_key"]),
+                "features": features,
+                "_canonical": canonical,
+                "choices": {},
+                "support": 0,
+            },
+        )
+        bucket["support"] += 1
+        bucket["choices"][str(chosen)] = bucket["choices"].get(str(chosen), 0) + 1
+
+    results: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        if bucket["support"] < min_support:
+            continue
+        # Dominant: highest count, ties broken alphabetically (stable).
+        sorted_choices = sorted(
+            bucket["choices"].items(), key=lambda kv: (-kv[1], kv[0])
+        )
+        dominant_choice, dominant_count = sorted_choices[0]
+        confidence = round(dominant_count / bucket["support"], 6)
+        results.append(
+            {
+                "decision_key": bucket["decision_key"],
+                "features": bucket["features"],
+                "dominant_choice": dominant_choice,
+                "dominant_count": dominant_count,
+                "support": bucket["support"],
+                "confidence": confidence,
+            }
+        )
+
+    results.sort(
+        key=lambda r: (-r["support"], -r["confidence"], r["decision_key"], r["_canonical"] if "_canonical" in r else ""),
+    )
+    # Drop the internal _canonical key from output rows.
+    for r in results:
+        r.pop("_canonical", None)
+    return results[:limit]
+
+
 def list_decision_choices(conn: sqlite3.Connection, decision_key: str) -> list[str]:
     cursor = conn.execute(
         """

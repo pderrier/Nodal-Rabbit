@@ -83,6 +83,63 @@ agentos wrap \
 AgentOS does not infer hidden model reasoning.
 It compiles only validated declared decisions with outcomes.
 
+### Structured features for rule mining
+
+A declared decision MAY include a `features` field — a flat dictionary of structured input attributes used for **feature-conditioned pattern mining**. This lets the rule extractor discover deterministic shortcuts like *"when `is_root=true` AND `has_mention=true`, the LLM always picks `feedback`"*, instead of just *"this decision_key is usually X"*.
+
+Schema:
+- `features` is an optional `dict[str, str | bool | int | float]`.
+- Keys are non-empty strings. Values must be primitives (no nested dicts/lists).
+- Decisions without features still work — they're handled by the (key-only) `patterns list`.
+
+Example payload:
+
+```json
+{
+  "step_id": "teams.classify_thread",
+  "decision_type": "llm",
+  "input_fingerprint": "sha256:...",
+  "output": {"chosen": "feedback", "confidence": 0.95},
+  "evidence": ["sender=Pierre Derrier", "channel=devops-claude"],
+  "features": {
+    "is_root": true,
+    "is_reply": false,
+    "has_mention": true,
+    "sender_is_devops": true,
+    "channel_id": "19:devops@thread.tacv2"
+  },
+  "compilation_candidate": true
+}
+```
+
+Recording from the CLI:
+
+```bash
+agentos decision record \
+  --run-id "$RUN_ID" \
+  --key teams.classify_thread \
+  --step teams.classify_thread \
+  --type llm \
+  --input-fingerprint "$FP" \
+  --output-json '{"chosen":"feedback","confidence":0.95}' \
+  --evidence-json '[]' \
+  --features-json '{"is_root":true,"has_mention":true,"sender_is_devops":true}' \
+  --candidate true
+```
+
+Mining feature-conditioned patterns:
+
+```bash
+# Bucket decisions by (decision_key, features) and report dominant choice per bucket.
+# Output: one JSON line per (decision_key, features) combo with confirmed outcomes.
+agentos patterns list --by-features --min-support 30
+
+# Filter to a single decision_key:
+agentos patterns list --by-features --decision-key teams.classify_thread --min-support 30
+```
+
+Feature-conditioned buckets with `confidence == 1.0` and high `support` are candidate deterministic rules — the input the rule extractor (planned) consumes to propose runtime short-circuits.
+
 ## Concrete headless integration example (Claude Code + Codex CLI)
 
 This example shows a wrapper-first integration where you keep your existing headless flows and only add explicit decision declarations.
