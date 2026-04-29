@@ -525,6 +525,94 @@ class CLITestCase(unittest.TestCase):
         self.assertEqual(by_choice["feedback"]["features"], {"is_root": True, "has_mention": True})
         self.assertEqual(by_choice["skip"]["support"], 2)
 
+    def test_rules_extract_emits_proposals_from_features(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.extract", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        # 12 unanimous feedback decisions (is_root=true)
+        for _ in range(12):
+            self._run_cli([
+                "decision", "record", "--run-id", run_id,
+                "--key", "teams.classify_thread", "--step", "teams.classify_thread",
+                "--type", "llm", "--input-fingerprint", "fp",
+                "--output-json", '{"chosen":"feedback"}',
+                "--evidence-json", "[]", "--candidate", "true",
+                "--features-json", '{"is_root": true, "has_mention": true}',
+            ])
+        # 12 unanimous skip decisions (is_root=false)
+        for _ in range(12):
+            self._run_cli([
+                "decision", "record", "--run-id", run_id,
+                "--key", "teams.classify_thread", "--step", "teams.classify_thread",
+                "--type", "llm", "--input-fingerprint", "fp",
+                "--output-json", '{"chosen":"skip"}',
+                "--evidence-json", "[]", "--candidate", "true",
+                "--features-json", '{"is_root": false, "has_mention": false}',
+            ])
+        self._run_cli([
+            "outcome", "record", "--run-id", run_id, "--status", "success", "--data-json", "{}",
+        ])
+
+        code, out, _ = self._run_cli([
+            "rules", "extract",
+            "--decision-key", "teams.classify_thread",
+            "--min-coverage", "10",
+            "--min-precision", "1.0",
+        ])
+        self.assertEqual(code, 0)
+        rules = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertTrue(rules, "expected at least one rule proposal")
+        # Each rule must be a perfect-precision proposal for this synthetic data.
+        for r in rules:
+            self.assertEqual(r["decision_key"], "teams.classify_thread")
+            self.assertEqual(r["precision"], 1.0)
+            self.assertGreaterEqual(r["coverage"], 10)
+            self.assertIsInstance(r["predicate"], list)
+
+    def test_rules_promote_extracted_round_trip_to_runtime_check(self) -> None:
+        """End-to-end Phase D: promote a feature rule via CLI, runtime SDK matches it."""
+        from agentos.runtime import check_rule
+
+        code, out, _ = self._run_cli([
+            "rules", "promote-extracted",
+            "--decision-key", "teams.classify_thread",
+            "--predicate-json",
+            '[{"feature":"is_root","op":"==","value":true},'
+            '{"feature":"has_mention","op":"==","value":true}]',
+            "--chosen", "feedback",
+            "--metrics-json", '{"coverage":47,"precision":1.0}',
+        ])
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual(result["chosen"], "feedback")
+        self.assertEqual(result["status"], "promoted")
+        self.assertTrue(result["fallback_enabled"])
+
+        # Now the runtime SDK must find this rule.
+        match = check_rule(
+            "teams.classify_thread",
+            {"is_root": True, "has_mention": True},
+            agentos_home=os.environ["AGENTOS_HOME"],
+        )
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match["chosen"], "feedback")
+        self.assertEqual(match["rule_id"], result["rule_id"])
+
+    def test_rules_promote_extracted_rejects_invalid_predicate(self) -> None:
+        # Not a JSON array → exit 1.
+        code, _, err = self._run_cli([
+            "rules", "promote-extracted",
+            "--decision-key", "k",
+            "--predicate-json", '{"not":"a list"}',
+            "--chosen", "x",
+        ])
+        self.assertEqual(code, 1)
+        self.assertIn("must be a JSON array", err)
+
     def test_backtest_run_outputs_walk_forward_metrics(self) -> None:
         code, out, _ = self._run_cli(
             ["wrap", "--intent", "demo.backtest", "--", "python", "-c", "print('ok')"]

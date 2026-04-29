@@ -138,7 +138,82 @@ agentos patterns list --by-features --min-support 30
 agentos patterns list --by-features --decision-key teams.classify_thread --min-support 30
 ```
 
-Feature-conditioned buckets with `confidence == 1.0` and high `support` are candidate deterministic rules — the input the rule extractor (planned) consumes to propose runtime short-circuits.
+Feature-conditioned buckets with `confidence == 1.0` and high `support` are candidate deterministic rules.
+
+### Decision-tree rule extraction
+
+`patterns list --by-features` reports *exact-match* feature buckets — useful when every feature is observed and bucketed identically across runs. For a more powerful mining loop that finds *subset* rules (e.g. *"the LLM picks `feedback` whenever `is_root=true` AND `has_mention=true`, regardless of other features"*), AgentOS ships a greedy decision-tree extractor:
+
+```bash
+agentos rules extract \
+  --decision-key teams.classify_thread \
+  --min-coverage 20 \
+  --min-precision 0.95 \
+  --max-depth 4
+```
+
+The extractor:
+1. Pulls all valid+candidate decisions for `--decision-key` with confirmed outcomes.
+2. Builds a greedy CART-like decision tree on the structured `features` field, splitting on the highest Gini-impurity reduction at each node.
+3. Walks high-precision leaves and emits one JSON-line rule proposal per qualifying leaf.
+
+Output shape (one JSON object per line):
+
+```json
+{
+  "decision_key": "teams.classify_thread",
+  "predicate": [
+    {"feature": "is_root", "op": "==", "value": true},
+    {"feature": "has_mention", "op": "==", "value": true}
+  ],
+  "chosen": "feedback",
+  "coverage": 47,
+  "precision": 1.0,
+  "support_total": 200,
+  "support_share": 0.235
+}
+```
+
+Rules are *proposals*, not promotions. Promotion to the rule store stays an explicit, human-reviewed step. The extractor is intentionally pure-Python with no ML dependency — Gini impurity, greedy single-feature splits, and equality-only predicates keep proposals simple and reviewable.
+
+### Promoting an extracted rule
+
+After reviewing the proposal, persist it with:
+
+```bash
+agentos rules promote-extracted \
+  --decision-key teams.classify_thread \
+  --predicate-json '[{"feature":"is_root","op":"==","value":true},
+                     {"feature":"has_mention","op":"==","value":true}]' \
+  --chosen feedback \
+  --metrics-json '{"coverage":47,"precision":1.0,"support_total":200}'
+```
+
+Promoted feature-rules live in the same `promoted_rules` table as key-only rules — they are distinguished by the `predicate_json` column.
+
+### Runtime: `check_rule()` SDK
+
+Wrapped workers consume promoted rules via the runtime SDK *before* invoking their LLM/agent — if a rule matches, the worker returns the deterministic answer and skips the model call entirely:
+
+```python
+from agentos.runtime import check_rule
+
+decision = check_rule("teams.classify_thread", {
+    "is_root": True,
+    "has_mention": True,
+    "sender_is_devops": True,
+})
+if decision is not None:
+    # Rule fired — skip the LLM, use the deterministic answer.
+    return decision["chosen"]  # → "feedback"
+
+# No rule matched — fall through to the model.
+return llm_classify(...)
+```
+
+Returns `None` when no rule matches — the caller decides what fallback to invoke (LLM, manual flow, etc.). The most specific rule (longest predicate) wins ties, mirroring how a decision tree's deeper leaves carry more discriminating information.
+
+This is the loop's payoff: when a feature combination has been observed enough times with a single deterministic outcome, the LLM call is replaced by a `dict` lookup. Cost drops, latency drops, accuracy rises (no model variance), and the fallback path is preserved by default.
 
 ## Concrete headless integration example (Claude Code + Codex CLI)
 

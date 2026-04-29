@@ -55,6 +55,17 @@ Please avoid contributions that move AgentOS into areas explicitly excluded in M
 - Contributors should run coverage locally and keep coverage high, with a default target of **>= 85%** on touched modules.
 - If coverage drops, the PR must explain why and include a remediation plan.
 
+### Public API contract tests
+
+`tests/test_public_api_contract.py` locks the *consumer-facing* surface of AgentOS. These tests assert the existence and signatures of importable symbols, the shape of CLI output, and the schema of the on-disk decision payload — anything downstream wrappers (e.g. `claude-alert-analyzer`'s `TeamsActionClassifier`) script against.
+
+Rules:
+- **DO NOT modify `test_public_api_contract.py` to make a failing test pass.** A failing contract test means you are making a breaking change. Coordinate with consumers, bump the major version, and update the contract test in the same PR.
+- New public symbols/CLI flags that consumers will rely on **MUST** be added to the contract suite in the same PR they ship in.
+- Changes that are intentionally NOT public (private helpers, internal refactors) belong in the regular suites (`test_storage.py`, `test_extractor.py`, etc.) and may evolve freely.
+
+This is the safety net that lets us refactor internals confidently without breaking downstream clients silently.
+
 ## Code and commit quality
 
 - Prefer clear, minimal changes over broad refactors.

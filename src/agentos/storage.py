@@ -5,7 +5,7 @@ import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +38,7 @@ class PromotedRuleRecord:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def resolve_home(agentos_home: str | None = None) -> Path:
@@ -119,6 +119,11 @@ def ensure_schema(home: Path) -> sqlite3.Connection:
         )
         """
     )
+    # Phase D migration: add predicate_json for feature-conditioned rules.
+    # Idempotent — only adds the column if it doesn't already exist.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(promoted_rules)")}
+    if "predicate_json" not in cols:
+        conn.execute("ALTER TABLE promoted_rules ADD COLUMN predicate_json TEXT")
     conn.commit()
     return conn
 
@@ -519,3 +524,79 @@ def get_latest_promoted_rule(conn: sqlite3.Connection, decision_key: str) -> sql
         (decision_key,),
     )
     return cursor.fetchone()
+
+
+def record_promoted_feature_rule(
+    conn: sqlite3.Connection,
+    *,
+    rule_id: str,
+    decision_key: str,
+    predicate: list[dict[str, Any]],
+    chosen: str,
+    metrics: dict[str, Any],
+    fallback_enabled: bool = True,
+    status: str = "promoted",
+) -> None:
+    """Persist a feature-conditioned rule (Phase D).
+
+    The predicate is a list of equality tests, e.g.::
+
+        [{"feature": "is_root", "op": "==", "value": True},
+         {"feature": "has_mention", "op": "==", "value": True}]
+
+    Stored next to the existing key-only promoted rules. ``predicate_json``
+    distinguishes the two: feature rules have it set, key-only rules don't.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO promoted_rules(
+            rule_id, decision_key, candidate_choice, status, fallback_enabled,
+            metrics_json, promoted_at, predicate_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rule_id,
+            decision_key,
+            chosen,
+            status,
+            int(fallback_enabled),
+            json.dumps(metrics, ensure_ascii=False),
+            utc_now_iso(),
+            json.dumps(predicate, ensure_ascii=False),
+        ),
+    )
+    conn.commit()
+
+
+def list_promoted_feature_rules(
+    conn: sqlite3.Connection, decision_key: str
+) -> list[sqlite3.Row]:
+    """Load active feature-conditioned rules for a decision_key.
+
+    Returned rules are ordered most-specific-first (longest predicate first).
+    Most-specific rules win at runtime, matching how a decision tree's deeper
+    leaves carry more discriminating information than shallower ones.
+    """
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        """
+        SELECT rule_id, decision_key, candidate_choice, status, fallback_enabled,
+               metrics_json, promoted_at, predicate_json
+        FROM promoted_rules
+        WHERE decision_key = ?
+          AND status = 'promoted'
+          AND predicate_json IS NOT NULL
+        """,
+        (decision_key,),
+    )
+    rows = list(cursor.fetchall())
+    # Sort by predicate length desc (most specific first), then promoted_at desc.
+    def _len(row: sqlite3.Row) -> int:
+        try:
+            pred = json.loads(row["predicate_json"]) if row["predicate_json"] else []
+            return len(pred) if isinstance(pred, list) else 0
+        except (TypeError, ValueError):
+            return 0
+    rows.sort(key=lambda r: (-_len(r), r["promoted_at"]), reverse=False)
+    rows.sort(key=lambda r: -_len(r))  # primary: longest predicate first
+    return rows
