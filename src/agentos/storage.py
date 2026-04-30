@@ -321,6 +321,7 @@ def list_decision_patterns_by_features(
     conn: sqlite3.Connection,
     *,
     decision_key: str | None = None,
+    prompt_version: str | None = None,
     min_support: int = 2,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
@@ -338,10 +339,23 @@ def list_decision_patterns_by_features(
 
     Decisions without a ``features`` field are skipped (handled by
     :func:`list_decision_patterns`).
+
+    When ``prompt_version`` is provided, only decisions whose
+    ``payload_json.prompt_version`` matches are considered. This lets
+    callers quarantine data from old prompt versions when prompts have
+    been revised to fix bugs (the older decisions reflect the buggy prompt
+    and would bias mining results).
     """
     conn.row_factory = sqlite3.Row
-    where_key = "AND decision_key = ?" if decision_key else ""
-    params: tuple = (decision_key,) if decision_key else ()
+    clauses: list[str] = []
+    params_list: list = []
+    if decision_key:
+        clauses.append("AND decision_key = ?")
+        params_list.append(decision_key)
+    if prompt_version:
+        clauses.append("AND json_extract(payload_json, '$.prompt_version') = ?")
+        params_list.append(prompt_version)
+    where_extra = " ".join(clauses)
     cursor = conn.execute(
         f"""
         SELECT
@@ -357,7 +371,7 @@ def list_decision_patterns_by_features(
             AND decision_source IN ('decision_file', 'stdout_marker', 'cli_record', 'sdk_record')
             AND decision_validity = 'valid'
             AND compilation_candidate = 1
-            {where_key}
+            {where_extra}
             AND EXISTS (
                 SELECT 1
                 FROM outcomes o
@@ -365,7 +379,7 @@ def list_decision_patterns_by_features(
                   AND o.status IN ('success', 'accepted')
             )
         """,
-        params,
+        tuple(params_list),
     )
 
     # Bucket in Python — features are arbitrary JSON dicts, easier to
@@ -475,6 +489,113 @@ def record_outcome(
     )
     conn.commit()
     return int(cursor.lastrowid)
+
+
+def find_divergent_runs(
+    conn: sqlite3.Connection,
+    *,
+    decision_key: str,
+    within_seconds: int,
+    prompt_version: str | None = None,
+) -> list[dict[str, Any]]:
+    """Find groups of runs that produced divergent ``chosen`` values for the
+    same ``input_fingerprint`` within the last ``within_seconds``.
+
+    A "divergent" group has at least two distinct ``chosen`` values among
+    decisions sharing the same input_fingerprint. This is the signal that
+    one (or more) of the decisions in the group is wrong — a deterministic
+    decision over an identical input should produce the same answer.
+
+    Returns a list of dicts shaped:
+        {
+            "input_fingerprint": str,
+            "decisions": [
+                {"decision_id": int, "run_id": str, "ts": str, "chosen": str},
+                ...sorted by ts ASC
+            ],
+        }
+
+    Filtering: only valid+candidate decisions are considered. When
+    ``prompt_version`` is provided, divergence is checked WITHIN that
+    prompt version only (cross-version divergences are usually expected
+    and shouldn't be auto-corrected).
+
+    The caller decides what to do (typically: latest-wins → mark earlier
+    divergent runs as ``outcome=rejected``).
+    """
+    conn.row_factory = sqlite3.Row
+    extra = ""
+    params: list = [decision_key]
+    if prompt_version is not None:
+        extra = "AND json_extract(payload_json, '$.prompt_version') = ?"
+        params.append(prompt_version)
+    cursor = conn.execute(
+        f"""
+        SELECT
+            id AS decision_id,
+            run_id,
+            ts,
+            json_extract(payload_json, '$.input_fingerprint') AS fingerprint,
+            COALESCE(
+                json_extract(payload_json, '$.output.chosen'),
+                json_extract(payload_json, '$.chosen')
+            ) AS chosen
+        FROM decisions
+        WHERE
+            decision_key = ?
+            AND decision_validity = 'valid'
+            AND compilation_candidate = 1
+            AND ts >= datetime('now', ?)
+            {extra}
+        ORDER BY ts ASC
+        """,
+        (*params[:1], f"-{int(within_seconds)} seconds", *params[1:]),
+    )
+    by_fp: dict[str, list[dict[str, Any]]] = {}
+    for row in cursor.fetchall():
+        fp = row["fingerprint"]
+        chosen = row["chosen"]
+        if not fp or chosen is None:
+            continue
+        by_fp.setdefault(str(fp), []).append({
+            "decision_id": int(row["decision_id"]),
+            "run_id": str(row["run_id"]),
+            "ts": str(row["ts"]),
+            "chosen": str(chosen),
+        })
+
+    out: list[dict[str, Any]] = []
+    for fp, group in by_fp.items():
+        unique_chosen = {d["chosen"] for d in group}
+        if len(unique_chosen) < 2:
+            continue
+        out.append({"input_fingerprint": fp, "decisions": group})
+    return out
+
+
+def has_outcome_with_marker(
+    conn: sqlite3.Connection,
+    run_id: str,
+    marker_key: str,
+    marker_value: str,
+) -> bool:
+    """Idempotency helper: check whether an outcome exists for ``run_id``
+    that already carries ``payload_json.{marker_key}`` == ``marker_value``.
+
+    Used by ``auto-correct`` to avoid double-recording the same correction
+    on repeated invocations.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        f"""
+        SELECT 1 FROM outcomes
+        WHERE run_id = ?
+          AND json_extract(payload_json, '$.{marker_key}') = ?
+        LIMIT 1
+        """,
+        (run_id, marker_value),
+    )
+    return cur.fetchone() is not None
 
 
 def record_promoted_rule(conn: sqlite3.Connection, promoted_rule: PromotedRuleRecord) -> None:

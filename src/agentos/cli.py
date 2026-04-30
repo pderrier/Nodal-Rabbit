@@ -21,6 +21,8 @@ from .storage import (
     get_latest_promoted_rule,
     get_decision,
     get_run,
+    find_divergent_runs,
+    has_outcome_with_marker,
     list_decision_choices,
     list_decision_patterns,
     list_decision_patterns_by_features,
@@ -107,6 +109,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="JSON object of structured features (str/bool/int/float values) for rule mining",
     )
+    decision_record.add_argument(
+        "--prompt-version",
+        default=None,
+        help="Optional non-empty string (e.g. sha256[:12] hash of prompt source). "
+             "Lets rule mining filter to decisions made under the *current* prompt; "
+             "decisions from older prompt versions can be quarantined when prompts "
+             "are revised to fix bugs.",
+    )
     decision_record.add_argument("--candidate", choices=("true", "false"), default=None)
     decision_record.add_argument(
         "--data-json",
@@ -128,13 +138,40 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     outcome_record.add_argument(
         "--status",
         required=True,
-        choices=("success", "accepted", "failure", "unknown"),
-        help="Outcome status",
+        choices=("success", "accepted", "failure", "unknown", "rejected"),
+        help="Outcome status. 'rejected' means the decision is now considered wrong and "
+             "should be excluded from rule mining (mining queries already filter "
+             "to status IN (success, accepted)).",
     )
     outcome_record.add_argument(
         "--data-json",
         default="{}",
         help="JSON payload for this outcome (default: {})",
+    )
+
+    outcome_auto = outcome_sub.add_parser(
+        "auto-correct",
+        help="Find runs that produced divergent `chosen` values for the same "
+             "input_fingerprint within a time window, and auto-record outcomes "
+             "(latest = accepted, earlier divergent = rejected). Idempotent.",
+    )
+    outcome_auto.add_argument(
+        "--decision-key", required=True,
+        help="Only auto-correct decisions with this decision_key.",
+    )
+    outcome_auto.add_argument(
+        "--within", default="24h",
+        help="Time window to scan for divergence. Suffix h or d (default: 24h).",
+    )
+    outcome_auto.add_argument(
+        "--prompt-version", default=None,
+        help="Optional: only consider decisions whose prompt_version matches. "
+             "Cross-prompt-version divergences are usually expected and shouldn't "
+             "be auto-corrected.",
+    )
+    outcome_auto.add_argument(
+        "--dry-run", action="store_true",
+        help="Don't write outcomes; just print what would be done.",
     )
 
     patterns = sub.add_parser(
@@ -156,6 +193,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--decision-key",
         default=None,
         help="Optional filter: only mine patterns for this decision_key (used with --by-features)",
+    )
+    patterns_list.add_argument(
+        "--prompt-version",
+        default=None,
+        help="Optional filter (used with --by-features): only consider decisions "
+             "whose prompt_version matches. Lets you mine clean data after a "
+             "prompt revision instead of letting old buggy decisions skew results.",
     )
 
     compile_cmd = sub.add_parser(
@@ -232,6 +276,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     rules_extract.add_argument(
         "--max-depth", type=int, default=4,
         help="Maximum predicate-conjunction length (default: 4)",
+    )
+    rules_extract.add_argument(
+        "--prompt-version",
+        default=None,
+        help="If set, only mine from decisions whose prompt_version matches. "
+             "Use this to quarantine data from older/buggy prompt versions.",
     )
 
     rules_promote_extracted = rules_sub.add_parser(
@@ -627,6 +677,13 @@ def _validate_declared_decision(payload: dict[str, object]) -> str:
             # Note: bool is a subclass of int in Python, both are accepted.
             if not isinstance(v, (str, bool, int, float)):
                 return "invalid_schema"
+    if "prompt_version" in payload:
+        prompt_version = payload.get("prompt_version")
+        # Must be a non-empty string when present. Convention: callers pass a
+        # short content hash (e.g. sha256[:12] of the prompt source) so rule
+        # mining can filter to decisions made under the *current* prompt.
+        if not isinstance(prompt_version, str) or not prompt_version.strip():
+            return "invalid_schema"
     candidate = _to_bool(payload.get("compilation_candidate"))
     if candidate is None:
         return "invalid_schema"
@@ -738,7 +795,7 @@ def _ingest_stdout_markers(*, home: Path, conn, run_id: str, stdout: str, allow_
 
 
 def _build_declared_decision_payload(args: argparse.Namespace, base_payload: dict[str, object]) -> dict[str, object]:
-    if not any([args.step_id, args.decision_type, args.input_refs, args.output_json, args.output_file, args.evidence_json, args.features_json, args.candidate]):
+    if not any([args.step_id, args.decision_type, args.input_refs, args.output_json, args.output_file, args.evidence_json, args.features_json, args.prompt_version, args.candidate]):
         return base_payload
 
     payload = dict(base_payload)
@@ -767,6 +824,10 @@ def _build_declared_decision_payload(args: argparse.Namespace, base_payload: dic
         if not isinstance(features, dict):
             raise SystemExit("--features-json must contain a JSON object")
         payload["features"] = features
+    if args.prompt_version:
+        if not isinstance(args.prompt_version, str) or not args.prompt_version.strip():
+            raise SystemExit("--prompt-version must be a non-empty string")
+        payload["prompt_version"] = args.prompt_version
     if args.candidate is not None:
         payload["compilation_candidate"] = args.candidate == "true"
     return payload
@@ -892,6 +953,104 @@ def cmd_outcome_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_within(spec: str) -> int:
+    """Parse a duration spec like '24h' / '7d' / '3600s' to seconds."""
+    spec = (spec or "").strip().lower()
+    if not spec:
+        raise SystemExit("--within must not be empty")
+    unit = spec[-1]
+    try:
+        value = int(spec[:-1]) if unit in ("s", "h", "d") else int(spec)
+    except ValueError:
+        raise SystemExit(f"--within invalid: {spec!r} (use e.g. 24h, 7d, 3600s)")
+    if value <= 0:
+        raise SystemExit("--within must be positive")
+    if unit == "h":
+        return value * 3600
+    if unit == "d":
+        return value * 86400
+    return value  # already seconds, or no unit (treated as seconds)
+
+
+def cmd_outcome_auto_correct(args: argparse.Namespace) -> int:
+    """Find divergent decisions and record latest-wins outcomes idempotently."""
+    home = resolve_home()
+    conn = ensure_schema(home)
+    within_seconds = _parse_within(args.within)
+
+    groups = find_divergent_runs(
+        conn,
+        decision_key=args.decision_key,
+        within_seconds=within_seconds,
+        prompt_version=args.prompt_version,
+    )
+
+    corrections: list[dict[str, object]] = []
+    for group in groups:
+        decisions = group["decisions"]
+        latest = decisions[-1]  # ts ASC → last is most recent
+        latest_chosen = latest["chosen"]
+        latest_run_id = latest["run_id"]
+
+        for d in decisions[:-1]:
+            if d["chosen"] == latest_chosen:
+                continue  # consistent with latest, no correction needed
+            # Idempotency marker: rejecting THIS run BECAUSE this specific
+            # later run produced a different chosen value.
+            marker_value = f"rejected_by:{latest_run_id}"
+            if has_outcome_with_marker(
+                conn, d["run_id"], "auto_correct_marker", marker_value
+            ):
+                continue  # already corrected
+            payload = {
+                "auto_correct_marker": marker_value,
+                "decision_key": args.decision_key,
+                "input_fingerprint": group["input_fingerprint"],
+                "rejected_chosen": d["chosen"],
+                "accepted_chosen": latest_chosen,
+                "accepted_run_id": latest_run_id,
+                "accepted_decision_id": latest["decision_id"],
+                "rejected_decision_id": d["decision_id"],
+                "ts_rejected": d["ts"],
+                "ts_accepted": latest["ts"],
+            }
+            corrections.append({
+                "rejected_run_id": d["run_id"],
+                "rejected_decision_id": d["decision_id"],
+                "rejected_chosen": d["chosen"],
+                "accepted_run_id": latest_run_id,
+                "accepted_chosen": latest_chosen,
+                "input_fingerprint": group["input_fingerprint"],
+                "applied": not args.dry_run,
+            })
+            if not args.dry_run:
+                record_outcome(conn, d["run_id"], "rejected", payload)
+                # Mark the latest run as 'accepted' too — once per group is
+                # enough; idempotency guard prevents duplicates.
+                accepted_marker = f"accepted_for:{group['input_fingerprint']}"
+                if not has_outcome_with_marker(
+                    conn, latest_run_id, "auto_correct_marker", accepted_marker
+                ):
+                    record_outcome(conn, latest_run_id, "accepted", {
+                        "auto_correct_marker": accepted_marker,
+                        "decision_key": args.decision_key,
+                        "input_fingerprint": group["input_fingerprint"],
+                        "ts_accepted": latest["ts"],
+                    })
+
+    summary = {
+        "decision_key": args.decision_key,
+        "within_seconds": within_seconds,
+        "prompt_version": args.prompt_version,
+        "divergent_groups": len(groups),
+        "corrections": corrections,
+        "applied_count": sum(1 for c in corrections if c["applied"]),
+        "dry_run": bool(args.dry_run),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_patterns_list(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
@@ -900,6 +1059,7 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
         rows = list_decision_patterns_by_features(
             conn,
             decision_key=getattr(args, "decision_key", None),
+            prompt_version=getattr(args, "prompt_version", None),
             min_support=args.min_support,
             limit=args.limit,
         )
@@ -1182,6 +1342,7 @@ def cmd_rules_extract(args: argparse.Namespace) -> int:
     rules = extract_rules_from_db(
         conn,
         decision_key=args.decision_key,
+        prompt_version=getattr(args, "prompt_version", None),
         min_coverage=args.min_coverage,
         min_precision=args.min_precision,
         max_depth=args.max_depth,
@@ -1344,6 +1505,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "outcome":
         if args.outcome_command == "record":
             return cmd_outcome_record(args)
+        if args.outcome_command == "auto-correct":
+            return cmd_outcome_auto_correct(args)
     if args.command == "patterns":
         if args.patterns_command == "list":
             return cmd_patterns_list(args)

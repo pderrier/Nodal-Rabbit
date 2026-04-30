@@ -1350,6 +1350,143 @@ class CLITestCase(unittest.TestCase):
         finally:
             os.chdir(cwd)
 
+    def test_decision_record_accepts_prompt_version_flag(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.pv", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, out, _ = self._run_cli([
+            "decision", "record",
+            "--run-id", run_id,
+            "--key", "k", "--step", "k", "--type", "llm",
+            "--input-fingerprint", "fp1",
+            "--output-json", '{"chosen":"x"}',
+            "--evidence-json", "[]",
+            "--candidate", "true",
+            "--prompt-version", "v1.0-abc123",
+        ])
+        self.assertEqual(code, 0)
+        decision_id = json.loads(out)["decision_id"]
+        self.assertEqual(json.loads(out)["decision_validity"], "valid")
+        code, show_out, _ = self._run_cli(["decision", "show", str(decision_id)])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            json.loads(show_out)["payload_json"]["prompt_version"],
+            "v1.0-abc123",
+        )
+
+    def test_decision_record_rejects_empty_prompt_version(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.empty_pv", "--", "python", "-c", "print('ok')"]
+        )
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        # The CLI raises SystemExit on whitespace-only prompt_version.
+        with self.assertRaises(SystemExit):
+            self._run_cli([
+                "decision", "record",
+                "--run-id", run_id,
+                "--key", "k", "--step", "k", "--type", "llm",
+                "--input-fingerprint", "fp",
+                "--output-json", '{"chosen":"x"}',
+                "--evidence-json", "[]",
+                "--candidate", "true",
+                "--prompt-version", "   ",  # whitespace-only
+            ])
+
+    def test_outcome_auto_correct_records_rejected_for_divergent_runs(self) -> None:
+        """End-to-end Step-4: two runs with same input_fingerprint but
+        different chosen → auto-correct records the earlier one as rejected
+        and the later one as accepted."""
+        # Two runs, recorded sequentially (later comes second)
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.ac1", "--", "python", "-c", "print('ok')"]
+        )
+        run_id_1 = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.ac2", "--", "python", "-c", "print('ok')"]
+        )
+        run_id_2 = json.loads(out.strip().splitlines()[-1])["run_id"]
+
+        # Same input_fingerprint, divergent chosen
+        for rid, chosen in ((run_id_1, "skip"), (run_id_2, "feedback")):
+            self._run_cli([
+                "decision", "record",
+                "--run-id", rid,
+                "--key", "teams.classify_thread",
+                "--step", "teams.classify_thread", "--type", "llm",
+                "--input-fingerprint", "fp_div",
+                "--output-json", f'{{"chosen":"{chosen}"}}',
+                "--evidence-json", "[]",
+                "--candidate", "true",
+            ])
+
+        # Auto-correct
+        code, out, _ = self._run_cli([
+            "outcome", "auto-correct",
+            "--decision-key", "teams.classify_thread",
+            "--within", "24h",
+        ])
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        self.assertEqual(summary["divergent_groups"], 1)
+        self.assertEqual(summary["applied_count"], 1)
+        # The first (skip) run should now have a 'rejected' outcome
+        self.assertEqual(len(summary["corrections"]), 1)
+        c = summary["corrections"][0]
+        self.assertEqual(c["rejected_run_id"], run_id_1)
+        self.assertEqual(c["accepted_run_id"], run_id_2)
+
+        # Idempotency: second run is a no-op
+        code, out, _ = self._run_cli([
+            "outcome", "auto-correct",
+            "--decision-key", "teams.classify_thread",
+            "--within", "24h",
+        ])
+        self.assertEqual(code, 0)
+        summary2 = json.loads(out)
+        self.assertEqual(summary2["applied_count"], 0)
+
+    def test_outcome_auto_correct_dry_run_does_not_write(self) -> None:
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.dr1", "--", "python", "-c", "print('ok')"]
+        )
+        run_id_1 = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, out, _ = self._run_cli(
+            ["wrap", "--intent", "demo.dr2", "--", "python", "-c", "print('ok')"]
+        )
+        run_id_2 = json.loads(out.strip().splitlines()[-1])["run_id"]
+        for rid, chosen in ((run_id_1, "skip"), (run_id_2, "feedback")):
+            self._run_cli([
+                "decision", "record",
+                "--run-id", rid,
+                "--key", "k", "--step", "k", "--type", "llm",
+                "--input-fingerprint", "fp_dry",
+                "--output-json", f'{{"chosen":"{chosen}"}}',
+                "--evidence-json", "[]", "--candidate", "true",
+            ])
+
+        code, out, _ = self._run_cli([
+            "outcome", "auto-correct",
+            "--decision-key", "k",
+            "--within", "24h",
+            "--dry-run",
+        ])
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        self.assertEqual(summary["divergent_groups"], 1)
+        self.assertEqual(summary["applied_count"], 0)
+        self.assertTrue(summary["dry_run"])
+        # Run again non-dry: still finds the divergence and applies
+        code, out, _ = self._run_cli([
+            "outcome", "auto-correct",
+            "--decision-key", "k",
+            "--within", "24h",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["applied_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

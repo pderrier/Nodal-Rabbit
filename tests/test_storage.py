@@ -12,6 +12,8 @@ from agentos.storage import (
     ensure_schema,
     get_decision,
     get_run,
+    find_divergent_runs,
+    has_outcome_with_marker,
     list_decision_choices,
     list_decisions,
     list_decision_patterns,
@@ -399,6 +401,114 @@ class StorageTestCase(unittest.TestCase):
         self._seed_decision("run_no_outcome", "k", {"chosen": "x", "features": {"f": 1}})
         rows = list_decision_patterns_by_features(self.conn, min_support=2)
         self.assertEqual(rows, [])
+
+
+    # ------------------------------------------------------------------
+    # prompt_version filter on feature pattern mining
+    # ------------------------------------------------------------------
+
+    def test_list_decision_patterns_by_features_filters_by_prompt_version(self) -> None:
+        self._seed_run("run_v1a")
+        self._seed_run("run_v1b")
+        self._seed_run("run_v2a")
+        self._seed_decision("run_v1a", "k", {
+            "chosen": "skip", "features": {"f": 1}, "prompt_version": "v1",
+        })
+        self._seed_decision("run_v1b", "k", {
+            "chosen": "skip", "features": {"f": 1}, "prompt_version": "v1",
+        })
+        self._seed_decision("run_v2a", "k", {
+            "chosen": "feedback", "features": {"f": 1}, "prompt_version": "v2",
+        })
+        # No filter: sees all 3 (mixed) — bucket has support=3 with conflicting choices
+        all_rows = list_decision_patterns_by_features(self.conn, min_support=2)
+        self.assertEqual(len(all_rows), 1)
+        self.assertEqual(all_rows[0]["support"], 3)
+        # Filter to v1 only: pure skip bucket of size 2
+        v1 = list_decision_patterns_by_features(
+            self.conn, prompt_version="v1", min_support=2,
+        )
+        self.assertEqual(len(v1), 1)
+        self.assertEqual(v1[0]["dominant_choice"], "skip")
+        self.assertEqual(v1[0]["support"], 2)
+        # Filter to v2 only: support=1, below min_support=2 → empty
+        v2 = list_decision_patterns_by_features(
+            self.conn, prompt_version="v2", min_support=2,
+        )
+        self.assertEqual(v2, [])
+
+    # ------------------------------------------------------------------
+    # find_divergent_runs / has_outcome_with_marker
+    # ------------------------------------------------------------------
+
+    def test_find_divergent_runs_groups_by_fingerprint(self) -> None:
+        # Three runs: same fingerprint but two different chosen values
+        self._seed_run("run_1")
+        self._seed_run("run_2")
+        self._seed_run("run_3")
+        self._seed_decision("run_1", "k", {
+            "chosen": "skip", "input_fingerprint": "fp_A",
+        })
+        self._seed_decision("run_2", "k", {
+            "chosen": "feedback", "input_fingerprint": "fp_A",
+        })
+        self._seed_decision("run_3", "k", {
+            "chosen": "skip", "input_fingerprint": "fp_B",  # different fp, no divergence
+        })
+        groups = find_divergent_runs(self.conn, decision_key="k", within_seconds=86400)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["input_fingerprint"], "fp_A")
+        self.assertEqual(len(groups[0]["decisions"]), 2)
+        # Sorted by ts ASC
+        self.assertEqual(groups[0]["decisions"][0]["chosen"], "skip")
+        self.assertEqual(groups[0]["decisions"][1]["chosen"], "feedback")
+
+    def test_find_divergent_runs_skips_consistent_groups(self) -> None:
+        self._seed_run("run_1")
+        self._seed_run("run_2")
+        # Two runs same fp, same chosen → not divergent
+        self._seed_decision("run_1", "k", {
+            "chosen": "skip", "input_fingerprint": "fp_A",
+        })
+        self._seed_decision("run_2", "k", {
+            "chosen": "skip", "input_fingerprint": "fp_A",
+        })
+        groups = find_divergent_runs(self.conn, decision_key="k", within_seconds=86400)
+        self.assertEqual(groups, [])
+
+    def test_find_divergent_runs_filters_by_prompt_version(self) -> None:
+        self._seed_run("run_v1")
+        self._seed_run("run_v2")
+        self._seed_decision("run_v1", "k", {
+            "chosen": "skip", "input_fingerprint": "fp",
+            "prompt_version": "v1",
+        })
+        self._seed_decision("run_v2", "k", {
+            "chosen": "feedback", "input_fingerprint": "fp",
+            "prompt_version": "v2",
+        })
+        # Cross-version "divergence" is expected and filtered out
+        v1_only = find_divergent_runs(
+            self.conn, decision_key="k", within_seconds=86400, prompt_version="v1",
+        )
+        self.assertEqual(v1_only, [])
+
+    def test_has_outcome_with_marker_idempotency(self) -> None:
+        self._seed_run("run_1")
+        self.assertFalse(has_outcome_with_marker(
+            self.conn, "run_1", "auto_correct_marker", "rejected_by:run_99",
+        ))
+        record_outcome(
+            self.conn, "run_1", "rejected",
+            {"auto_correct_marker": "rejected_by:run_99"},
+        )
+        self.assertTrue(has_outcome_with_marker(
+            self.conn, "run_1", "auto_correct_marker", "rejected_by:run_99",
+        ))
+        # Different marker value → still False
+        self.assertFalse(has_outcome_with_marker(
+            self.conn, "run_1", "auto_correct_marker", "rejected_by:run_77",
+        ))
 
 
 if __name__ == "__main__":
