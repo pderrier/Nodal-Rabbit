@@ -215,6 +215,56 @@ Returns `None` when no rule matches — the caller decides what fallback to invo
 
 This is the loop's payoff: when a feature combination has been observed enough times with a single deterministic outcome, the LLM call is replaced by a `dict` lookup. Cost drops, latency drops, accuracy rises (no model variance), and the fallback path is preserved by default.
 
+### Quarantining buggy data with `prompt_version`
+
+When a prompt is revised to fix a misclassification bug, decisions made under the old prompt are now *biased data* — promoting a rule mined from them would lock the bug deterministically. AgentOS supports tagging each decision with a `prompt_version` (free-form non-empty string, conventionally a short content hash of the prompt source):
+
+```bash
+agentos decision record \
+  --key teams.classify_thread \
+  --step teams.classify_thread \
+  --type llm \
+  --input-fingerprint "$FP" \
+  --output-json '{"chosen":"feedback"}' \
+  --evidence-json '[]' \
+  --features-json '{"is_root": true, "has_mention": true}' \
+  --prompt-version "$PROMPT_HASH" \
+  --candidate true
+```
+
+Mining and rule extraction then accept a matching `--prompt-version` filter so old data is excluded:
+
+```bash
+# Only consider decisions made under the current prompt:
+agentos patterns list --by-features --prompt-version "$PROMPT_HASH"
+agentos rules extract --decision-key teams.classify_thread --prompt-version "$PROMPT_HASH"
+```
+
+When the prompt changes, bump the version. Mined data accumulated under the old version stays in the DB (useful for forensics) but never poisons the next round of rule promotion.
+
+### Auto-correcting divergent decisions with `outcome auto-correct`
+
+LLM non-determinism produces a recurring failure mode: the same `input_fingerprint` produces different `chosen` values across runs. Treating each decision as truth would seed contradictory training data. AgentOS provides a sweep command that finds these divergent groups and records latest-wins outcomes:
+
+```bash
+agentos outcome auto-correct \
+  --decision-key teams.classify_thread \
+  --within 24h \
+  [--prompt-version "$PROMPT_HASH"] \
+  [--dry-run]
+```
+
+For each `(decision_key, input_fingerprint)` group within the window with at least two distinct `chosen` values:
+- The most recent decision is recorded as `outcome=accepted`.
+- Earlier decisions whose `chosen` differed from the latest are recorded as `outcome=rejected`.
+- Rule mining queries already filter to `outcomes.status IN ('success', 'accepted')`, so rejected decisions are automatically excluded.
+
+The command is **idempotent** (re-running on the same data does nothing) via a per-correction marker stored in the outcome payload. Use `--dry-run` to preview corrections without writing.
+
+`--prompt-version` filters the sweep to a single prompt version: cross-prompt-version divergences are usually expected (the prompt was revised) and shouldn't be auto-corrected.
+
+This is a cheap signal — no human labelling, no external ground truth — that turns LLM disagreement-with-itself into training-data hygiene. Wire it as a periodic job alongside the rule miner.
+
 ## Concrete headless integration example (Claude Code + Codex CLI)
 
 This example shows a wrapper-first integration where you keep your existing headless flows and only add explicit decision declarations.

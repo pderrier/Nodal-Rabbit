@@ -157,6 +157,43 @@ class DecisionPayloadFeaturesContractTestCase(unittest.TestCase):
         }
         self.assertEqual(_validate_declared_decision(payload), "valid")
 
+    def test_prompt_version_field_is_optional_string(self) -> None:
+        """Consumers (e.g. alert_brain) emit a prompt_version hash so rule
+        mining can quarantine data made under buggy prompts. The field
+        must remain (a) optional, (b) accept any non-empty string."""
+        from agentos.cli import _validate_declared_decision
+
+        base = {
+            "step_id": "k",
+            "decision_type": "llm",
+            "input_fingerprint": "fp",
+            "output": {"chosen": "x"},
+            "evidence": [],
+            "compilation_candidate": True,
+        }
+        # Optional: omitting prompt_version stays valid
+        self.assertEqual(_validate_declared_decision(base), "valid")
+        # Present + non-empty: valid
+        self.assertEqual(
+            _validate_declared_decision({**base, "prompt_version": "v1.0-abc123"}),
+            "valid",
+        )
+        # Empty string: invalid
+        self.assertEqual(
+            _validate_declared_decision({**base, "prompt_version": ""}),
+            "invalid_schema",
+        )
+        # Whitespace only: invalid
+        self.assertEqual(
+            _validate_declared_decision({**base, "prompt_version": "  "}),
+            "invalid_schema",
+        )
+        # Non-string: invalid
+        self.assertEqual(
+            _validate_declared_decision({**base, "prompt_version": 42}),
+            "invalid_schema",
+        )
+
 
 class StorageContractTestCase(unittest.TestCase):
     """Storage-layer functions consumers may call directly."""
@@ -289,6 +326,76 @@ class CLIContractTestCase(unittest.TestCase):
         """The --by-features flag is part of the public CLI."""
         # Empty store is fine — flag must just be accepted, not produce an error.
         code, _ = self._run(["patterns", "list", "--by-features"])
+        self.assertEqual(code, 0)
+
+    def test_patterns_list_accepts_prompt_version_flag(self) -> None:
+        """The --prompt-version flag is part of the public CLI for mining."""
+        code, _ = self._run([
+            "patterns", "list", "--by-features",
+            "--prompt-version", "v1",
+        ])
+        self.assertEqual(code, 0)
+
+    def test_rules_extract_accepts_prompt_version_flag(self) -> None:
+        """The --prompt-version flag is part of the public CLI for rule extraction."""
+        code, _ = self._run([
+            "rules", "extract",
+            "--decision-key", "k",
+            "--prompt-version", "v1",
+        ])
+        self.assertEqual(code, 0)
+
+    def test_decision_record_accepts_prompt_version_flag(self) -> None:
+        """The --prompt-version flag must remain accepted on `decision record`."""
+        code, out = self._run([
+            "wrap", "--intent", "demo_pv_contract", "--",
+            "python", "-c", "print('ok')",
+        ])
+        self.assertEqual(code, 0)
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, out = self._run([
+            "decision", "record", "--run-id", run_id,
+            "--key", "k", "--step", "k", "--type", "llm",
+            "--input-fingerprint", "fp",
+            "--output-json", '{"chosen":"x"}',
+            "--evidence-json", "[]", "--candidate", "true",
+            "--prompt-version", "v1.contract",
+        ])
+        self.assertEqual(code, 0)
+
+    def test_outcome_auto_correct_command_exists_and_accepts_documented_flags(self) -> None:
+        """The `outcome auto-correct` subcommand must remain accepted with
+        the flags consumer scripts pass: --decision-key, --within,
+        --prompt-version, --dry-run."""
+        code, out = self._run([
+            "outcome", "auto-correct",
+            "--decision-key", "teams.classify_thread",
+            "--within", "24h",
+            "--prompt-version", "v1",
+            "--dry-run",
+        ])
+        self.assertEqual(code, 0)
+        # Output is JSON with documented keys
+        summary = json.loads(out)
+        for key in ("decision_key", "within_seconds", "divergent_groups",
+                    "corrections", "applied_count", "dry_run"):
+            self.assertIn(key, summary)
+
+    def test_outcome_record_status_accepts_rejected(self) -> None:
+        """The 'rejected' status is part of the public CLI vocabulary,
+        used by auto-correct and (potentially) consumers wanting to
+        manually mark a decision as bad."""
+        code, out = self._run([
+            "wrap", "--intent", "demo_rejected", "--",
+            "python", "-c", "print('ok')",
+        ])
+        run_id = json.loads(out.strip().splitlines()[-1])["run_id"]
+        code, _ = self._run([
+            "outcome", "record",
+            "--run-id", run_id,
+            "--status", "rejected",
+            "--data-json", '{}',
+        ])
         self.assertEqual(code, 0)
 
 

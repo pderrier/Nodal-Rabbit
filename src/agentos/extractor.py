@@ -289,13 +289,24 @@ def extract_rules(
 def load_labeled_samples(
     conn: sqlite3.Connection,
     decision_key: str,
+    *,
+    prompt_version: str | None = None,
 ) -> list[Sample]:
     """Pull all valid+candidate decisions with features for ``decision_key``
     where the run has a confirmed outcome (status in success/accepted).
+
+    When ``prompt_version`` is provided, only decisions whose
+    ``payload_json.prompt_version`` matches are returned. Use this to
+    quarantine data made under buggy/stale prompts.
     """
     conn.row_factory = sqlite3.Row
+    extra_clause = ""
+    params: list = [decision_key]
+    if prompt_version is not None:
+        extra_clause = "AND json_extract(payload_json, '$.prompt_version') = ?"
+        params.append(prompt_version)
     cursor = conn.execute(
-        """
+        f"""
         SELECT
             COALESCE(
                 json_extract(payload_json, '$.output.chosen'),
@@ -308,13 +319,14 @@ def load_labeled_samples(
             AND decision_source IN ('decision_file', 'stdout_marker', 'cli_record', 'sdk_record')
             AND decision_validity = 'valid'
             AND compilation_candidate = 1
+            {extra_clause}
             AND EXISTS (
                 SELECT 1 FROM outcomes o
                 WHERE o.run_id = decisions.run_id
                   AND o.status IN ('success', 'accepted')
             )
         """,
-        (decision_key,),
+        tuple(params),
     )
     samples: list[Sample] = []
     for row in cursor.fetchall():
@@ -336,12 +348,19 @@ def extract_rules_from_db(
     conn: sqlite3.Connection,
     *,
     decision_key: str,
+    prompt_version: str | None = None,
     min_coverage: int = 20,
     min_precision: float = 0.95,
     max_depth: int = 4,
 ) -> list[Rule]:
-    """Load samples for a decision_key from the DB and run the extractor."""
-    samples = load_labeled_samples(conn, decision_key)
+    """Load samples for a decision_key from the DB and run the extractor.
+
+    ``prompt_version`` filters samples to a specific prompt version — see
+    :func:`load_labeled_samples`.
+    """
+    samples = load_labeled_samples(
+        conn, decision_key, prompt_version=prompt_version,
+    )
     return extract_rules(
         samples,
         decision_key=decision_key,
