@@ -278,6 +278,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Maximum predicate-conjunction length (default: 4)",
     )
     rules_extract.add_argument(
+        "--max-cardinality", type=int, default=10,
+        help="Skip features with more distinct values than this (default: 10). "
+             "Prevents high-cardinality features like channel_id from dominating the tree.",
+    )
+    rules_extract.add_argument(
         "--prompt-version",
         default=None,
         help="If set, only mine from decisions whose prompt_version matches. "
@@ -1346,6 +1351,7 @@ def cmd_rules_extract(args: argparse.Namespace) -> int:
         min_coverage=args.min_coverage,
         min_precision=args.min_precision,
         max_depth=args.max_depth,
+        max_cardinality=args.max_cardinality,
     )
     for rule in rules:
         print(json.dumps(rule.to_dict(), ensure_ascii=False))

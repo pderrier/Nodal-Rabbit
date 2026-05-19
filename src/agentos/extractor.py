@@ -106,7 +106,11 @@ def _gini(samples: list[Sample]) -> float:
     return 1.0 - sum((c / total) ** 2 for c in counts.values())
 
 
-def _candidate_splits(samples: list[Sample]) -> list[tuple[str, Any]]:
+def _candidate_splits(
+    samples: list[Sample],
+    *,
+    max_cardinality: int = 10,
+) -> list[tuple[str, Any]]:
     """Enumerate (feature, value) pairs to consider as split candidates.
 
     For boolean/string/int-like features: each unique value becomes a test
@@ -114,12 +118,25 @@ def _candidate_splits(samples: list[Sample]) -> list[tuple[str, Any]]:
     unique value gets the same treatment (this is a simplification — for
     truly continuous features a quantile-based split would be better, but
     AgentOS features are typically boolean/categorical).
+
+    Features with more than ``max_cardinality`` distinct values are skipped —
+    high-cardinality features (e.g. channel_id) create fine-grained splits
+    that don't generalize into useful rules.
     """
+    # First pass: count distinct values per feature
+    feature_values: dict[str, set[tuple[str, Any]]] = {}
+    for s in samples:
+        for k, v in s.features.items():
+            key = (type(v).__name__, v)
+            feature_values.setdefault(k, set()).add(key)
+
+    # Second pass: build candidates, skipping high-cardinality features
     seen: set[tuple[str, Any]] = set()
     candidates: list[tuple[str, Any]] = []
     for s in samples:
         for k, v in s.features.items():
-            # Hash with type to avoid mixing True with 1
+            if len(feature_values.get(k, ())) > max_cardinality:
+                continue
             key = (k, type(v).__name__, v)
             if key in seen:
                 continue
@@ -142,7 +159,11 @@ def _split_samples(
     return matching, non_matching
 
 
-def _best_split(samples: list[Sample]) -> tuple[str, Any, float] | None:
+def _best_split(
+    samples: list[Sample],
+    *,
+    max_cardinality: int = 10,
+) -> tuple[str, Any, float] | None:
     """Find (feature, value, gain) with highest Gini-impurity reduction.
 
     Returns None if no useful split exists (gain == 0 or both children empty).
@@ -154,7 +175,7 @@ def _best_split(samples: list[Sample]) -> tuple[str, Any, float] | None:
         return None  # already pure
     total = len(samples)
     best: tuple[str, Any, float] | None = None
-    for feature, value in _candidate_splits(samples):
+    for feature, value in _candidate_splits(samples, max_cardinality=max_cardinality):
         match, other = _split_samples(samples, feature, value)
         if not match or not other:
             continue
@@ -175,21 +196,22 @@ def _build_tree(
     *,
     max_depth: int,
     min_split: int,
+    max_cardinality: int = 10,
     depth: int = 0,
 ) -> _TreeNode:
     """Build a greedy CART-like tree."""
     node = _TreeNode(samples=samples)
     if len(samples) < min_split or depth >= max_depth:
         return node
-    split = _best_split(samples)
+    split = _best_split(samples, max_cardinality=max_cardinality)
     if split is None:
         return node
     feature, value, _gain = split
     match, other = _split_samples(samples, feature, value)
     node.split_feature = feature
     node.split_value = value
-    node.match_child = _build_tree(match, max_depth=max_depth, min_split=min_split, depth=depth + 1)
-    node.other_child = _build_tree(other, max_depth=max_depth, min_split=min_split, depth=depth + 1)
+    node.match_child = _build_tree(match, max_depth=max_depth, min_split=min_split, max_cardinality=max_cardinality, depth=depth + 1)
+    node.other_child = _build_tree(other, max_depth=max_depth, min_split=min_split, max_cardinality=max_cardinality, depth=depth + 1)
     return node
 
 
@@ -240,6 +262,7 @@ def extract_rules(
     min_coverage: int = 20,
     min_precision: float = 0.95,
     max_depth: int = 4,
+    max_cardinality: int = 10,
 ) -> list[Rule]:
     """Build the tree, walk it, and return rule proposals.
 
@@ -249,6 +272,9 @@ def extract_rules(
         min_coverage: minimum number of samples a leaf must cover.
         min_precision: minimum class purity at the leaf (1.0 = unanimous).
         max_depth: maximum tree depth (caps predicate-conjunction length).
+        max_cardinality: features with more distinct values than this are
+            excluded from splits (prevents high-cardinality features like
+            channel_id from dominating the tree).
 
     Returns rules sorted by (precision desc, coverage desc).
     """
@@ -258,6 +284,7 @@ def extract_rules(
         samples,
         max_depth=max_depth,
         min_split=max(2, min_coverage),
+        max_cardinality=max_cardinality,
     )
     rules: list[Rule] = []
     total = len(samples)
@@ -352,6 +379,7 @@ def extract_rules_from_db(
     min_coverage: int = 20,
     min_precision: float = 0.95,
     max_depth: int = 4,
+    max_cardinality: int = 10,
 ) -> list[Rule]:
     """Load samples for a decision_key from the DB and run the extractor.
 
@@ -367,4 +395,5 @@ def extract_rules_from_db(
         min_coverage=min_coverage,
         min_precision=min_precision,
         max_depth=max_depth,
+        max_cardinality=max_cardinality,
     )
