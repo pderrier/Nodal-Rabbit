@@ -9,8 +9,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from collections import Counter
 
+from .kernel import compute_backtest_metrics
 from .storage import (
     PromotedRuleRecord,
     RunRecord,
@@ -1107,72 +1107,11 @@ def cmd_patterns_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _dominant_choice(choices: list[str]) -> tuple[str, float]:
-    counts = Counter(choices)
-    winner, winner_count = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0]
-    return winner, winner_count / len(choices)
-
-
-def _compute_backtest_metrics(
-    decision_key: str,
-    choices: list[str],
-    min_history: int,
-    min_confidence: float,
-) -> dict[str, object]:
-    total = len(choices)
-    if total < 2:
-        return {
-            "decision_key": decision_key,
-            "error": "not_enough_data",
-            "total_observations": total,
-        }
-
-    correct = 0
-    predicted = 0
-    abstained = 0
-
-    for idx in range(total):
-        if idx < min_history:
-            abstained += 1
-            continue
-
-        history = choices[:idx]
-        dominant, confidence = _dominant_choice(history)
-        if confidence < min_confidence:
-            abstained += 1
-            continue
-
-        predicted += 1
-        if choices[idx] == dominant:
-            correct += 1
-
-    final_dominant, final_confidence = _dominant_choice(choices)
-    accuracy = (correct / predicted) if predicted else 0.0
-    abstain_rate = abstained / total
-    coverage_rate = predicted / total
-
-    return {
-        "decision_key": decision_key,
-        "total_observations": total,
-        "min_history": min_history,
-        "min_confidence": min_confidence,
-        "candidate_choice": final_dominant,
-        "candidate_confidence": round(final_confidence, 6),
-        "predictions": predicted,
-        "abstentions": abstained,
-        "correct_predictions": correct,
-        "accuracy": round(accuracy, 6),
-        "abstain_rate": round(abstain_rate, 6),
-        "coverage_rate": round(coverage_rate, 6),
-        "promote_ready": predicted > 0 and accuracy == 1.0,
-    }
-
-
 def cmd_backtest_run(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
     choices = list_decision_choices(conn, decision_key=args.decision_key)
-    metrics = _compute_backtest_metrics(
+    metrics = compute_backtest_metrics(
         decision_key=args.decision_key,
         choices=choices,
         min_history=args.min_history,
@@ -1186,7 +1125,7 @@ def cmd_rules_promote(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
     choices = list_decision_choices(conn, decision_key=args.decision_key)
-    metrics = _compute_backtest_metrics(
+    metrics = compute_backtest_metrics(
         decision_key=args.decision_key,
         choices=choices,
         min_history=args.min_history,
@@ -1250,7 +1189,7 @@ def cmd_rules_reject(args: argparse.Namespace) -> int:
     home = resolve_home()
     conn = ensure_schema(home)
     choices = list_decision_choices(conn, decision_key=args.decision_key)
-    metrics = _compute_backtest_metrics(
+    metrics = compute_backtest_metrics(
         decision_key=args.decision_key,
         choices=choices,
         min_history=args.min_history,

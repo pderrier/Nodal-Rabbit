@@ -26,7 +26,10 @@ and the predicate doesn't match, the SDK still returns ``None`` — fallback
 behavior is the worker's responsibility, not the SDK's.
 
 Design notes:
-- The SDK is a *thin* helper: predicate evaluation is plain dict-equality.
+- This module is the STORAGE/ADAPTER layer: it LOADS promoted rules from the
+  SQLite store, then delegates the pure per-clause predicate evaluation to
+  the storage-agnostic kernel (:func:`agentos.kernel.predicate_matches`).
+  The matching LOGIC lives in the kernel; this layer only wires it to the DB.
 - Rules are loaded fresh from the SQLite store on each call (no caching at
   the v1 API). Wrapped workers should batch lookups if hot.
 - The SDK never falls back implicitly — when no rule matches, it returns
@@ -38,37 +41,17 @@ import json
 import sqlite3
 from typing import Any
 
+from agentos.kernel import predicate_matches as _predicate_matches
 from agentos.storage import (
     db_path,
     list_promoted_feature_rules,
     resolve_home,
 )
 
-
-def _predicate_matches(predicate: list[dict[str, Any]], features: dict[str, Any]) -> bool:
-    """Evaluate a list of equality tests as a conjunction.
-
-    A predicate is a list of ``{"feature": str, "op": "==", "value": <prim>}``
-    dicts. ``op`` is currently always ``==`` — extending to ``!=`` / ``in``
-    is a follow-up. An empty predicate (``[]``) matches everything; this
-    represents an unconditional rule for a decision_key.
-    """
-    if not isinstance(predicate, list):
-        return False
-    for clause in predicate:
-        if not isinstance(clause, dict):
-            return False
-        feature = clause.get("feature")
-        op = clause.get("op", "==")
-        value = clause.get("value")
-        if not isinstance(feature, str):
-            return False
-        if op != "==":
-            # Unknown op — be conservative and reject.
-            return False
-        if features.get(feature) != value:
-            return False
-    return True
+# Re-export the pure matcher at its historical path so existing importers
+# (e.g. tests, downstream consumers) keep working. The implementation now
+# lives in the kernel — this is a thin alias, not a duplicate.
+__all__ = ["check_rule", "_predicate_matches"]
 
 
 def check_rule(
@@ -97,7 +80,9 @@ def check_rule(
 
     The rule with the *longest* predicate (most specific) wins ties. This
     mirrors how a decision tree's deeper leaves carry more discriminating
-    information than shallower ones.
+    information than shallower ones. Rows arrive most-specific-first from
+    :func:`agentos.storage.list_promoted_feature_rules`; the first whose
+    predicate matches wins.
     """
     own_conn = conn is None
     if conn is None:
